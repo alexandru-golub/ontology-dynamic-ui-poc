@@ -1,0 +1,28 @@
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: graph-surfaces-neo4j
+    ports:
+      - "7477:7474"
+      - "7689:7687"
+    environment:
+      NEO4J_AUTH: neo4j/local-dev-password
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - ./neo4j/data:/data
+      - ./neo4j/logs:/logs
+      - ./neo4j/import:/var/lib/neo4j/import
+  app:
+    build: .
+    depends_on:
+      - neo4j
+    ports:
+      - "3000:3000"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: local-dev-password
+      DEMO_USER_EMAIL: john@example.com
+    volumes:
+      - .:/app
+      - /app/node_modules
