@@ -2,6 +2,16 @@ import { driver } from "../lib/neo4j";
 
 const clearQuery = `MATCH (n) DETACH DELETE n`;
 
+const constraints = [
+  `CREATE CONSTRAINT user_id IF NOT EXISTS FOR (n:User) REQUIRE n.id IS UNIQUE`,
+  `CREATE CONSTRAINT surface_id IF NOT EXISTS FOR (n:Surface) REQUIRE n.id IS UNIQUE`,
+  `CREATE CONSTRAINT column_id IF NOT EXISTS FOR (n:Column) REQUIRE n.id IS UNIQUE`,
+  `CREATE CONSTRAINT role_name IF NOT EXISTS FOR (n:Role) REQUIRE n.name IS UNIQUE`,
+  `CREATE CONSTRAINT customer_name IF NOT EXISTS FOR (n:Customer) REQUIRE n.name IS UNIQUE`,
+  `CREATE CONSTRAINT status_name IF NOT EXISTS FOR (n:Status) REQUIRE n.name IS UNIQUE`,
+  `CREATE CONSTRAINT project_id IF NOT EXISTS FOR (n:Project) REQUIRE n.id IS UNIQUE`,
+];
+
 const query = `
 // ---- Users & roles -------------------------------------------------------
 CREATE (admin:User {id: 'admin_001', name: 'Ada Admin', isAdmin: true})
@@ -12,13 +22,13 @@ CREATE (admin)-[:HAS_ROLE]->(adminRole)
 
 // ---- Surfaces (UI planes defined in the graph) ---------------------------
 CREATE (projectsSurface:Surface {id: 'projects', title: 'Project Overview', name: 'Projects Matrix', renderer: 'table', rootLabel: 'Project'})
-CREATE (customersSurface:Surface {id: 'customers', title: 'Customer Portfolio', name: 'Customers', renderer: 'table', rootLabel: 'Customer'})
-CREATE (peopleSurface:Surface {id: 'people', title: 'People & Roles', name: 'People', renderer: 'table', rootLabel: 'User'})
+CREATE (customersSurface:Surface {id: 'customers', title: 'Customer Portfolio', name: 'Customers', renderer: 'cards', rootLabel: 'Customer'})
+CREATE (peopleSurface:Surface {id: 'people', title: 'People & Roles', name: 'People', renderer: 'board', rootLabel: 'User'})
 
 // Projects surface — rows are Projects; columns come from Project, Customer and Status nodes
-CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: 'Customer.name', suggest: true})
+CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: '<HAS_PROJECT:Customer.name', suggest: true})
 CREATE (c2:Column {id: 'col_project', field: 'project', label: 'Project Title', order: 2, source: 'self.name'})
-CREATE (c3:Column {id: 'col_status', field: 'status', label: 'Status', order: 3, source: 'Status.name', suggest: true})
+CREATE (c3:Column {id: 'col_status', field: 'status', label: 'Status', order: 3, source: '>HAS_STATUS:Status.name', suggest: true})
 CREATE (c4:Column {id: 'col_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner', suggest: true})
 CREATE (c5:Column {id: 'col_budget', field: 'budget', label: 'Budget (USD)', order: 5, source: 'self.budget'})
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c1)
@@ -39,7 +49,7 @@ CREATE (customersSurface)-[:HAS_COLUMN]->(d4)
 
 // People surface — rows are Users; columns mix User props and their Role names
 CREATE (e1:Column {id: 'col3_user', field: 'user', label: 'Name', order: 1, source: 'self.name'})
-CREATE (e2:Column {id: 'col3_role', field: 'role', label: 'Role', order: 2, source: 'Role.name', suggest: true})
+CREATE (e2:Column {id: 'col3_role', field: 'role', label: 'Role', order: 2, source: '>HAS_ROLE:Role.name', suggest: true})
 CREATE (e3:Column {id: 'col3_admin', field: 'admin', label: 'Admin', order: 3, source: 'self.isAdmin'})
 CREATE (peopleSurface)-[:HAS_COLUMN]->(e1)
 CREATE (peopleSurface)-[:HAS_COLUMN]->(e2)
@@ -80,6 +90,7 @@ CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete:
 async function seed() {
   const session = driver.session();
   try {
+    for (const constraint of constraints) await session.run(constraint);
     await session.run(clearQuery);
     await session.run(query);
     console.log("Seeded admin, 2 demo users, 3 multi-source surfaces and permissions.");

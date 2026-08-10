@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sanitizeLabel as validateRootLabel } from "./db";
 import { GraphQLScalarType, Kind, buildSchema } from "graphql";
 import { driver } from "./neo4j";
 import {
@@ -13,6 +14,8 @@ import {
   adminDeleteRole,
   adminDeleteSurface,
   adminDeleteUser,
+  adminPurgeSurface,
+  adminRestoreSurface,
   adminGrant,
   adminRemoveRole,
   adminRevoke,
@@ -31,7 +34,10 @@ import {
   requireAdmin,
   requirePermission,
   runSurfaceRows,
+  surfaceRowsPage,
   updateRow,
+  validateRenderer,
+  validateSource,
 } from "./db";
 
 // ---------------------------------------------------------------------------
@@ -67,6 +73,22 @@ type SurfacePermissions {
 type SurfaceRow {
   id: ID!
   values: JSON!
+}
+
+type SurfaceRowEdge {
+  cursor: String!
+  node: SurfaceRow!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+type SurfaceRowConnection {
+  edges: [SurfaceRowEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
 }
 
 type SurfacePayload {
@@ -118,6 +140,7 @@ type AdminSurfaceSummary {
   renderer: String!
   rootLabel: String!
   columnCount: Int!
+  deleted: Boolean!
 }
 
 input SurfaceUpdateInput {
@@ -175,6 +198,7 @@ input AdminSurfaceInput {
 type Query {
   me: UserInfo!
   getSurface(surfaceId: ID!): SurfacePayload!
+  surfaceRows(surfaceId: ID!, first: Int, after: String): SurfaceRowConnection!
   listSurfaces: [SurfaceSummary!]!
   adminUsers: [AdminUser!]!
   adminRoles: [RoleInfo!]!
@@ -208,6 +232,8 @@ type Mutation {
   adminCreateSurface(input: AdminSurfaceInput!): SurfaceSummary!
   adminUpdateSurface(id: ID!, input: SurfaceUpdateInput!): SurfaceSummary!
   adminDeleteSurface(id: ID!): Boolean!
+  adminRestoreSurface(id: ID!): Boolean!
+  adminPurgeSurface(id: ID!): Boolean!
 }
 `;
 
@@ -264,6 +290,15 @@ export function getSchema(userId: string) {
   queryType.getFields().getSurface.resolve = async (_source, { surfaceId }: { surfaceId: string }) =>
     getSurfacePayload(userId, surfaceId);
 
+  queryType.getFields().surfaceRows.resolve = async (
+    _source,
+    { surfaceId, first, after }: { surfaceId: string; first?: number; after?: string },
+  ) => {
+    await requirePermission(userId, surfaceId, "view");
+    const surface = await getSurfaceMeta(surfaceId);
+    return surfaceRowsPage(surface, first ?? 50, after ?? undefined);
+  };
+
   queryType.getFields().listSurfaces.resolve = async () => listSurfaces(userId);
 
   queryType.getFields().adminUsers.resolve = async () => {
@@ -314,6 +349,8 @@ export function getSchema(userId: string) {
     { surfaceId, input }: { surfaceId: string; input: { title?: string; renderer?: string; rootLabel?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
+    if (input.rootLabel) validateRootLabel(input.rootLabel);
+    validateRenderer(input.renderer);
     const session = driver.session({ defaultAccessMode: "WRITE" });
     try {
       await session.run(
@@ -332,6 +369,7 @@ export function getSchema(userId: string) {
     { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
+    validateSource(input.source, input.field);
     const surface = await getSurfaceMeta(surfaceId);
     const order = input.order ?? Math.max(0, ...surface.columns.map((c) => c.order)) + 1;
     const session = driver.session({ defaultAccessMode: "WRITE" });
@@ -362,6 +400,7 @@ export function getSchema(userId: string) {
     { surfaceId, columnId, input }: { surfaceId: string; columnId: string; input: { field?: string; label?: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
+    if (input.source != null) validateSource(input.source, input.field ?? "field");
     const session = driver.session({ defaultAccessMode: "WRITE" });
     try {
       await session.run(
@@ -489,6 +528,16 @@ export function getSchema(userId: string) {
   mutationType.getFields().adminDeleteSurface.resolve = async (_source, { id }: { id: string }) => {
     await requireAdmin(userId);
     return adminDeleteSurface(id);
+  };
+
+  mutationType.getFields().adminRestoreSurface.resolve = async (_source, { id }: { id: string }) => {
+    await requireAdmin(userId);
+    return adminRestoreSurface(id);
+  };
+
+  mutationType.getFields().adminPurgeSurface.resolve = async (_source, { id }: { id: string }) => {
+    await requireAdmin(userId);
+    return adminPurgeSurface(id);
   };
 
   return schema;

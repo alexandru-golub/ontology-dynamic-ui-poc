@@ -23,13 +23,6 @@ const ALL_TRUE: Permissions = { view: true, create: true, update: true, delete: 
 const ALL_FALSE: Permissions = { view: false, create: false, update: false, delete: false, export: false, manage: false };
 const PERMISSION_KEYS = ["view", "create", "update", "delete", "export", "manage"] as const;
 
-/** Relationship map used by generic row writes: neighbor label -> how to link it. */
-const NEIGHBOR_LINKS: Record<string, { rel: string; dir: "in" | "out" }> = {
-  Customer: { rel: "HAS_PROJECT", dir: "in" },
-  Status: { rel: "HAS_STATUS", dir: "out" },
-  Role: { rel: "HAS_ROLE", dir: "out" },
-};
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -44,39 +37,89 @@ export function toPlain(value: unknown): unknown {
   return value;
 }
 
-function sanitizeLabel(label: string): string {
+export function sanitizeLabel(label: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(label)) {
     throw new GraphQLError(`Invalid label "${label}"`, { extensions: { code: "BAD_INPUT" } });
   }
   return label;
 }
 
+/** Renderers implemented in the frontend; `Surface.renderer` must be one of these. */
+export const RENDERERS = ["table", "cards", "form", "board", "timeline"] as const;
+
+export function validateRenderer(renderer: string | null | undefined): void {
+  if (renderer && !(RENDERERS as readonly string[]).includes(renderer)) {
+    throw new GraphQLError(
+      `Unknown renderer "${renderer}". Supported: ${RENDERERS.join(", ")}.`,
+      { extensions: { code: "BAD_INPUT" } },
+    );
+  }
+}
+
 export type ColumnSource =
   | { kind: "self"; prop: string }
-  | { kind: "neighbor"; label: string; prop: string }
-  | { kind: "count"; label: string };
+  | { kind: "neighbor"; label: string; prop: string; rel: string | null; dir: "in" | "out" | null }
+  | { kind: "count"; label: string; rel: string | null; dir: "in" | "out" | null };
 
-/** Resolve a column's `source` spec into a read/write route. */
+const LABEL_RE = "[A-Za-z_][A-Za-z0-9_]*";
+
+/**
+ * Resolve a column's `source` spec into a read/write route.
+ *
+ * Supported syntax:
+ *   self.<prop>                       property on the row root node
+ *   <Label>.<prop>                    legacy: neighbor by label (any relationship)
+ *   <Label>.count                     legacy: count of neighbors by label
+ *   >Rel:Label.<prop>                 outgoing relationship: (root)-[:Rel]->(:Label)
+ *   <Rel:Label.<prop>                 incoming relationship: (root)<-[:Rel]-(:Label)
+ *   >Rel:Label.count / <Rel:Label.count   counts over a typed relationship
+ */
 export function parseSource(source: string | null | undefined, field: string): ColumnSource {
   const src = (source ?? "").trim();
   if (src.startsWith("self.")) return { kind: "self", prop: src.slice(5) || field };
-  // Label.count must be checked before Label.prop (count would match as a prop name)
-  const countMatch = src.match(/^([A-Za-z_][A-Za-z0-9_]*)\.count$/);
-  if (countMatch) return { kind: "count", label: countMatch[1] };
-  const match = src.match(/^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$/);
-  if (match) return { kind: "neighbor", label: match[1], prop: match[2] };
+  // typed relationship syntax (check before legacy Label.prop)
+  const typedCount = src.match(new RegExp(`^([<>])(${LABEL_RE}):(${LABEL_RE})\.count$`));
+  if (typedCount) {
+    return { kind: "count", label: typedCount[3], rel: typedCount[2], dir: typedCount[1] === ">" ? "out" : "in" };
+  }
+  const typed = src.match(new RegExp(`^([<>])(${LABEL_RE}):(${LABEL_RE})\.(${LABEL_RE})$`));
+  if (typed) {
+    return { kind: "neighbor", label: typed[3], prop: typed[4], rel: typed[2], dir: typed[1] === ">" ? "out" : "in" };
+  }
+  // legacy Label.count
+  const countMatch = src.match(new RegExp(`^(${LABEL_RE})\.count$`));
+  if (countMatch) return { kind: "count", label: countMatch[1], rel: null, dir: null };
+  // legacy Label.prop
+  const match = src.match(new RegExp(`^(${LABEL_RE})\.(${LABEL_RE})$`));
+  if (match) return { kind: "neighbor", label: match[1], prop: match[2], rel: null, dir: null };
   // legacy inference by field name
-  if (field === "customer") return { kind: "neighbor", label: "Customer", prop: "name" };
-  if (field === "status") return { kind: "neighbor", label: "Status", prop: "name" };
+  if (field === "customer") return { kind: "neighbor", label: "Customer", prop: "name", rel: null, dir: null };
+  if (field === "status") return { kind: "neighbor", label: "Status", prop: "name", rel: null, dir: null };
   if (field === "project") return { kind: "self", prop: "name" };
   return { kind: "self", prop: field };
+}
+
+/** Throw a GraphQL error if a column source is not one of the supported shapes. */
+export function validateSource(source: string | null | undefined, field: string): void {
+  const src = (source ?? "").trim();
+  if (!src) return; // legacy inference by field name applies
+  const known =
+    src.startsWith("self.") ||
+    new RegExp(`^[<>]${LABEL_RE}:${LABEL_RE}\.(${LABEL_RE}|count)$`).test(src) ||
+    new RegExp(`^${LABEL_RE}\.(${LABEL_RE}|count)$`).test(src);
+  if (!known) {
+    throw new GraphQLError(
+      `Invalid column source "${src}" for field "${field}". Use self.prop, Label.prop, Label.count, >Rel:Label.prop, <Rel:Label.prop, >Rel:Label.count or <Rel:Label.count.`,
+      { extensions: { code: "BAD_INPUT" } },
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Surface metadata + multi-source row projection
 // ---------------------------------------------------------------------------
 const surfaceMetaCypher = `
-MATCH (s:Surface {id: $surfaceId})
+MATCH (s:Surface {id: $surfaceId}) WHERE coalesce(s.deleted, false) = false
 OPTIONAL MATCH (s)-[:HAS_COLUMN]->(column:Column)
 WITH s, column ORDER BY column.order
 RETURN s.id AS id,
@@ -119,11 +162,23 @@ function buildProjectionQuery(rootLabel: string, columns: Column[], rowId?: stri
   columns.forEach((column, index) => {
     const source = parseSource(column.source, column.field);
     if (source.kind === "neighbor") {
-      clauses.push(`OPTIONAL MATCH (root)--(n${index}:${source.label})`);
+      const pattern =
+        source.rel && source.dir === "in"
+          ? `(root)<-[n${index}_r:${source.rel}]-(n${index}:${source.label})`
+          : source.rel && source.dir === "out"
+            ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
+            : `(root)--(n${index}:${source.label})`;
+      clauses.push(`OPTIONAL MATCH ${pattern}`);
       returns.push(`collect(DISTINCT n${index}.${source.prop})[0] AS v${index}`);
       aliases[column.field] = `v${index}`;
     } else if (source.kind === "count") {
-      clauses.push(`OPTIONAL MATCH (root)--(n${index}:${source.label})`);
+      const pattern =
+        source.rel && source.dir === "in"
+          ? `(root)<-[n${index}_r:${source.rel}]-(n${index}:${source.label})`
+          : source.rel && source.dir === "out"
+            ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
+            : `(root)--(n${index}:${source.label})`;
+      clauses.push(`OPTIONAL MATCH ${pattern}`);
       returns.push(`count(DISTINCT n${index}) AS v${index}`);
       aliases[column.field] = `v${index}`;
     }
@@ -231,11 +286,26 @@ export async function requireAdmin(userId: string): Promise<UserInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// Row CRUD (generic over the surface's root label)
+// Row CRUD (generic over the surface's root label + typed relationship sources)
 // ---------------------------------------------------------------------------
+type LinkSpec = { rel: string; dir: "in" | "out"; label: string; prop: string; name: string };
+
+/** Relationship map used by legacy (untyped) neighbor sources for writes. */
+const LEGACY_LINKS: Record<string, { rel: string; dir: "in" | "out" }> = {
+  Customer: { rel: "HAS_PROJECT", dir: "in" },
+  Status: { rel: "HAS_STATUS", dir: "out" },
+  Role: { rel: "HAS_ROLE", dir: "out" },
+};
+
+/**
+ * Route an incoming `values` map onto root properties and typed-relationship
+ * neighbors. Neighbors are keyed by column field so mutation responses can be
+ * assembled per column. Untyped (`Label.prop`) sources fall back to the legacy
+ * link map; unknown labels are read-only (no write).
+ */
 function routeValues(columns: Column[], values: Record<string, unknown>) {
   const props: Record<string, unknown> = {};
-  const neighbors: Record<string, { rel: string; dir: "in" | "out"; name: string }> = {};
+  const neighbors: Record<string, LinkSpec> = {};
   for (const column of columns) {
     const raw = values[column.field];
     if (raw === undefined || raw === null) continue;
@@ -244,8 +314,17 @@ function routeValues(columns: Column[], values: Record<string, unknown>) {
     if (source.kind === "self") {
       props[source.prop] = toPlain(raw);
     } else if (source.kind === "neighbor") {
-      const link = NEIGHBOR_LINKS[source.label];
-      if (link && text !== "") neighbors[source.label] = { ...link, name: text };
+      let rel = source.rel;
+      let dir = source.dir;
+      if (!rel || !dir) {
+        const legacy = LEGACY_LINKS[source.label];
+        if (!legacy) continue; // read-only column
+        rel = legacy.rel;
+        dir = legacy.dir;
+      }
+      if (text !== "") {
+        neighbors[column.field] = { rel, dir, label: source.label, prop: source.prop, name: text };
+      }
     }
   }
   return { props, neighbors };
@@ -255,27 +334,46 @@ function routeValues(columns: Column[], values: Record<string, unknown>) {
 function valuesFromWrite(
   surface: SurfaceMeta,
   rootProps: Record<string, unknown>,
-  neighbors: Record<string, { rel: string; dir: "in" | "out"; name: string }>,
+  neighbors: Record<string, LinkSpec>,
 ): Record<string, unknown> {
   const values: Record<string, unknown> = {};
   for (const column of surface.columns) {
     const source = parseSource(column.source, column.field);
     if (source.kind === "self") values[column.field] = toPlain(rootProps[source.prop]) ?? null;
-    else if (source.kind === "neighbor") values[column.field] = neighbors[source.label]?.name ?? null;
+    else if (source.kind === "neighbor") values[column.field] = neighbors[column.field]?.name ?? null;
     else values[column.field] = null;
   }
   return values;
+}
+
+/** The (rel, dir) pairs a surface can write to — used to detach stale links on update. */
+function writableLinkKinds(surface: SurfaceMeta): Array<{ rel: string; dir: "in" | "out" }> {
+  const kinds = new Map<string, { rel: string; dir: "in" | "out" }>();
+  for (const column of surface.columns) {
+    const source = parseSource(column.source, column.field);
+    if (source.kind !== "neighbor") continue;
+    let rel = source.rel;
+    let dir = source.dir;
+    if (!rel || !dir) {
+      const legacy = LEGACY_LINKS[source.label];
+      if (!legacy) continue;
+      rel = legacy.rel;
+      dir = legacy.dir;
+    }
+    kinds.set(`${dir}:${rel}`, { rel, dir });
+  }
+  return [...kinds.values()];
 }
 
 export async function createRow(surfaceId: string, values: Record<string, unknown>): Promise<SurfaceRow> {
   const surface = await getSurfaceMeta(surfaceId);
   const { props, neighbors } = routeValues(surface.columns, values);
   const label = sanitizeLabel(surface.rootLabel);
-  const mergeParts = Object.keys(neighbors).map((n) => `MERGE (n_${n}:${n} {name: $name_${n}})`);
-  const linkParts: string[] = [];
-  for (const [n, info] of Object.entries(neighbors)) {
-    linkParts.push(info.dir === "in" ? `CREATE (n_${n})-[:${info.rel}]->(root)` : `CREATE (root)-[:${info.rel}]->(n_${n})`);
-  }
+  const specs = Object.values(neighbors);
+  const mergeParts = specs.map((spec, i) => `MERGE (n_${i}:${spec.label} {${spec.prop}: $prop_${i}})`);
+  const linkParts = specs.map((spec, i) =>
+    spec.dir === "in" ? `CREATE (n_${i})-[:${spec.rel}]->(root)` : `CREATE (root)-[:${spec.rel}]->(n_${i})`,
+  );
   const query = `
 CREATE (root:\`${label}\` {id: $rowId})
 SET root += $props
@@ -283,7 +381,9 @@ ${mergeParts.join("\n")}
 ${linkParts.join("\n")}
 RETURN elementId(root) AS id, properties(root) AS rootProps`;
   const params: Record<string, unknown> = { rowId: `row_${randomUUID()}`, props };
-  for (const [n, info] of Object.entries(neighbors)) params[`name_${n}`] = info.name;
+  specs.forEach((spec, i) => {
+    params[`prop_${i}`] = spec.name;
+  });
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
     const result = await session.run(query, params);
@@ -300,44 +400,32 @@ export async function updateRow(surfaceId: string, rowId: string, values: Record
   if (!current) throw new GraphQLError("Row not found", { extensions: { code: "NOT_FOUND" } });
   const merged = { ...current.values, ...values };
   const { props, neighbors } = routeValues(surface.columns, merged);
-  const label = sanitizeLabel(surface.rootLabel);
-  void label;
-
-  // For every neighbor kind present in the surface, detach existing links, then re-link if a value was provided.
-  const neighborKinds = new Set<string>();
-  for (const column of surface.columns) {
-    const source = parseSource(column.source, column.field);
-    if (source.kind === "neighbor" && NEIGHBOR_LINKS[source.label]) neighborKinds.add(source.label);
-  }
+  const specs = Object.values(neighbors);
   const params: Record<string, unknown> = { rowId, props };
-  for (const [n, info] of Object.entries(neighbors)) params[`name_${n}`] = info.name;
+  specs.forEach((spec, i) => {
+    params[`prop_${i}`] = spec.name;
+  });
 
-  // Three statements, each individually valid Cypher (Cypher requires WITH between
-  // MATCH and a preceding SET/CREATE/DELETE/MERGE updating clause).
-  // Cypher: a MATCH may not follow an updating clause (DELETE/SET/CREATE/MERGE)
-  // without an intervening WITH, so separate every delete with `WITH root`.
+  // Three statements, each individually valid Cypher (a MATCH may not follow a
+  // SET/CREATE/DELETE/MERGE updating clause without an intervening WITH).
   const deleteRels = `
 MATCH (root) WHERE elementId(root) = $rowId
-${[...neighborKinds]
-  .map((n) => {
-    const info = NEIGHBOR_LINKS[n];
-    return info.dir === "in"
-      ? `OPTIONAL MATCH (root)<-[r_${n}:${info.rel}]-(:${n}) DELETE r_${n}`
-      : `OPTIONAL MATCH (root)-[r_${n}:${info.rel}]->(:${n}) DELETE r_${n}`;
-  })
+${writableLinkKinds(surface)
+  .map(
+    (kind) =>
+      kind.dir === "in"
+        ? `OPTIONAL MATCH (root)<-[r_${kind.rel}:${kind.rel}]-() DELETE r_${kind.rel}`
+        : `OPTIONAL MATCH (root)-[r_${kind.rel}:${kind.rel}]->() DELETE r_${kind.rel}`,
+  )
   .join("\nWITH root\n")}`;
   const setProps = `
 MATCH (root) WHERE elementId(root) = $rowId
 SET root += $props`;
   const relink = `
 MATCH (root) WHERE elementId(root) = $rowId
-${Object.keys(neighbors)
-  .map((n) => `MERGE (n_${n}:${n} {name: $name_${n}})`)
-  .join("\n")}
-${Object.entries(neighbors)
-  .map(([n, info]) =>
-    info.dir === "in" ? `CREATE (n_${n})-[:${info.rel}]->(root)` : `CREATE (root)-[:${info.rel}]->(n_${n})`,
-  )
+${specs.map((spec, i) => `MERGE (n_${i}:${spec.label} {${spec.prop}: $prop_${i}})`).join("\n")}
+${specs
+  .map((spec, i) => (spec.dir === "in" ? `CREATE (n_${i})-[:${spec.rel}]->(root)` : `CREATE (root)-[:${spec.rel}]->(n_${i})`))
   .join("\n")}
 RETURN elementId(root) AS id, properties(root) AS rootProps`;
 
@@ -373,6 +461,33 @@ RETURN cnt`,
 }
 
 // ---------------------------------------------------------------------------
+// Paged row connection (cursor = base64 offset; ordered by elementId)
+// ---------------------------------------------------------------------------
+export async function surfaceRowsPage(
+  surface: SurfaceMeta,
+  first = 50,
+  after?: string,
+): Promise<{ edges: Array<{ cursor: string; node: SurfaceRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null }; totalCount: number }> {
+  const limit = Math.min(Math.max(first, 1), 500);
+  const skip = after ? parseInt(Buffer.from(after, "base64url").toString("utf8").replace("offset:", ""), 10) || 0 : 0;
+  const { query, aliases } = buildProjectionQuery(surface.rootLabel, surface.columns);
+  const session = driver.session({ defaultAccessMode: "READ" });
+  try {
+    const countResult = await session.run(`MATCH (root:\`${sanitizeLabel(surface.rootLabel)}\`) RETURN count(root) AS c`);
+    const totalCount = countResult.records[0].get("c").toNumber();
+    const pageResult = await session.run(`${query}\nORDER BY elementId(root) SKIP toInteger($skip) LIMIT toInteger($limit)`, { skip, limit });
+    const rows = assembleRows(pageResult.records, surface.columns, aliases);
+    const edges = rows.map((node, i) => ({ cursor: Buffer.from(`offset:${skip + i}`).toString("base64url"), node }));
+    // The end cursor points one past the last returned row, so the next page
+    // skips exactly what this page consumed.
+    const endCursor = edges.length ? Buffer.from(`offset:${skip + edges.length}`).toString("base64url") : null;
+    return { edges, pageInfo: { hasNextPage: skip + rows.length < totalCount, endCursor }, totalCount };
+  } finally {
+    await session.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Surfaces (shared helpers)
 // ---------------------------------------------------------------------------
 export async function listSurfaces(userId: string) {
@@ -381,7 +496,7 @@ export async function listSurfaces(userId: string) {
     const session = driver.session({ defaultAccessMode: "READ" });
     try {
       const result = await session.run(
-        `MATCH (s:Surface) RETURN s.id AS id, coalesce(s.title, s.name) AS title, s.renderer AS renderer, coalesce(s.rootLabel, 'Project') AS rootLabel ORDER BY s.id`,
+        `MATCH (s:Surface) WHERE coalesce(s.deleted, false) = false RETURN s.id AS id, coalesce(s.title, s.name) AS title, s.renderer AS renderer, coalesce(s.rootLabel, 'Project') AS rootLabel ORDER BY s.id`,
       );
       return result.records.map((record) => record.toObject());
     } finally {
@@ -396,7 +511,7 @@ MATCH (u:User {id: $userId})
 OPTIONAL MATCH (u)-[:HAS_ROLE]->(:Role)-[p:CAN_ACCESS]->(s:Surface)
 OPTIONAL MATCH (u)-[o:SURFACE_OVERRIDE]->(s)
 WITH s, [permission IN collect(properties(p)) WHERE permission IS NOT NULL] AS rolePermissions, head(collect(properties(o))) AS override
-WHERE s IS NOT NULL
+WHERE s IS NOT NULL AND coalesce(s.deleted, false) = false
 WITH s, CASE WHEN override.view = false THEN false WHEN override.view = true THEN true ELSE any(permission IN rolePermissions WHERE permission.view = true) END AS canView
 WHERE canView
 RETURN s.id AS id, coalesce(s.title, s.name) AS title, s.renderer AS renderer, coalesce(s.rootLabel, 'Project') AS rootLabel
@@ -514,12 +629,12 @@ export async function adminSurfaces() {
       `
 MATCH (s:Surface)
 OPTIONAL MATCH (s)-[:HAS_COLUMN]->(c:Column)
-RETURN s.id AS id, coalesce(s.title, s.name) AS title, s.renderer AS renderer, coalesce(s.rootLabel, 'Project') AS rootLabel, count(c) AS columnCount
+RETURN s.id AS id, coalesce(s.title, s.name) AS title, s.renderer AS renderer, coalesce(s.rootLabel, 'Project') AS rootLabel, count(c) AS columnCount, coalesce(s.deleted, false) AS deleted
 ORDER BY s.id`,
     );
     return result.records.map((record) => {
       const obj = record.toObject();
-      return { id: obj.id, title: obj.title, renderer: obj.renderer, rootLabel: obj.rootLabel, columnCount: toPlain(obj.columnCount) };
+      return { id: obj.id, title: obj.title, renderer: obj.renderer, rootLabel: obj.rootLabel, columnCount: toPlain(obj.columnCount), deleted: Boolean(obj.deleted) };
     });
   } finally {
     await session.close();
@@ -532,10 +647,17 @@ ORDER BY s.id`,
 export async function adminCreateUser(input: { id: string; name: string; isAdmin?: boolean }) {
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
-    await session.run(
-      `CREATE (u:User {id: $id, name: $name, isAdmin: coalesce($isAdmin, false)})`,
-      { id: input.id, name: input.name, isAdmin: input.isAdmin ?? false },
-    );
+    try {
+      await session.run(
+        `CREATE (u:User {id: $id, name: $name, isAdmin: coalesce($isAdmin, false)})`,
+        { id: input.id, name: input.name, isAdmin: input.isAdmin ?? false },
+      );
+    } catch (err) {
+      if (err instanceof Error && /constraint|ConstraintValidationFailed|already exists/i.test(err.message)) {
+        throw new GraphQLError(`A user with id "${input.id}" already exists`, { extensions: { code: "BAD_USER_INPUT" } });
+      }
+      throw err;
+    }
   } finally {
     await session.close();
   }
@@ -720,12 +842,27 @@ export async function adminCreateSurface(input: {
   rootLabel?: string;
   columns?: Array<{ field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string }>;
 }) {
+  sanitizeLabel(input.rootLabel ?? "Project");
+  validateRenderer(input.renderer);
+  for (const column of input.columns ?? []) {
+    if (!column.field?.trim() || !column.label?.trim()) {
+      throw new GraphQLError("Column field and label are required", { extensions: { code: "BAD_INPUT" } });
+    }
+    validateSource(column.source, column.field);
+  }
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
-    await session.run(
-      `CREATE (s:Surface {id: $id, title: $title, renderer: coalesce($renderer, 'table'), rootLabel: coalesce($rootLabel, 'Project')})`,
-      { id: input.id, title: input.title, renderer: input.renderer ?? null, rootLabel: input.rootLabel ?? null },
-    );
+    try {
+      await session.run(
+        `CREATE (s:Surface {id: $id, title: $title, renderer: coalesce($renderer, 'table'), rootLabel: coalesce($rootLabel, 'Project')})`,
+        { id: input.id, title: input.title, renderer: input.renderer ?? null, rootLabel: input.rootLabel ?? null },
+      );
+    } catch (err) {
+      if (err instanceof Error && /constraint|already exists/i.test(err.message)) {
+        throw new GraphQLError(`A surface with id "${input.id}" already exists`, { extensions: { code: "BAD_USER_INPUT" } });
+      }
+      throw err;
+    }
     for (const [index, column] of (input.columns ?? []).entries()) {
       await session.run(
         `MATCH (s:Surface {id: $id})
@@ -750,6 +887,8 @@ export async function adminCreateSurface(input: {
 }
 
 export async function adminUpdateSurface(id: string, input: { title?: string; renderer?: string; rootLabel?: string }) {
+  if (input.rootLabel) sanitizeLabel(input.rootLabel);
+  if (input.renderer) validateRenderer(input.renderer);
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
     const result = await session.run(
@@ -766,6 +905,33 @@ export async function adminUpdateSurface(id: string, input: { title?: string; re
 }
 
 export async function adminDeleteSurface(id: string): Promise<boolean> {
+  // Soft delete: keep the definition graph, hide the surface everywhere.
+  const session = driver.session({ defaultAccessMode: "WRITE" });
+  try {
+    const result = await session.run(
+      `MATCH (s:Surface {id: $id}) SET s.deleted = true RETURN count(s) AS cnt`,
+      { id },
+    );
+    return result.records[0].get("cnt").toNumber() > 0;
+  } finally {
+    await session.close();
+  }
+}
+
+export async function adminRestoreSurface(id: string): Promise<boolean> {
+  const session = driver.session({ defaultAccessMode: "WRITE" });
+  try {
+    const result = await session.run(
+      `MATCH (s:Surface {id: $id}) SET s.deleted = false RETURN count(s) AS cnt`,
+      { id },
+    );
+    return result.records[0].get("cnt").toNumber() > 0;
+  } finally {
+    await session.close();
+  }
+}
+
+export async function adminPurgeSurface(id: string): Promise<boolean> {
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
     await session.run(`MATCH (s:Surface {id: $id}) OPTIONAL MATCH (s)-[:HAS_COLUMN]->(c:Column) DETACH DELETE c`, { id });

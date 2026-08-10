@@ -35,6 +35,9 @@ export function DataTable({
   searchable = true,
   suggestions,
   emptyMessage = "No rows.",
+  hasNextPage = false,
+  totalCount,
+  onLoadMore,
 }: {
   columns: TableColumn[];
   rows: TableRowData[];
@@ -46,6 +49,9 @@ export function DataTable({
   searchable?: boolean;
   suggestions?: Record<string, string[]>;
   emptyMessage?: string;
+  hasNextPage?: boolean;
+  totalCount?: number;
+  onLoadMore?: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortState>(null);
@@ -218,8 +224,15 @@ export function DataTable({
           </TableBody>
         </Table>
       </div>
-      <div className="border-t px-3 py-2 text-xs text-muted-foreground">
-        {filteredRows.length} of {rows.length} row{rows.length === 1 ? "" : "s"}
+      <div className="flex items-center justify-between border-t px-3 py-2 text-xs text-muted-foreground">
+        <span>
+          {filteredRows.length} of {totalCount ?? rows.length} row{(totalCount ?? rows.length) === 1 ? "" : "s"}
+        </span>
+        {hasNextPage && (
+          <Button size="sm" variant="outline" onClick={onLoadMore}>
+            Load more
+          </Button>
+        )}
       </div>
     </div>
   );

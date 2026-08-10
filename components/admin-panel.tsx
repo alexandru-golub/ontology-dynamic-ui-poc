@@ -75,6 +75,7 @@ const ADMIN_SURFACES = gql`
       renderer
       rootLabel
       columnCount
+      deleted
     }
   }
 `;
@@ -174,6 +175,18 @@ const DELETE_SURFACE = gql`
   }
 `;
 
+const RESTORE_SURFACE = gql`
+  mutation AdminRestoreSurface($id: ID!) {
+    adminRestoreSurface(id: $id)
+  }
+`;
+
+const PURGE_SURFACE = gql`
+  mutation AdminPurgeSurface($id: ID!) {
+    adminPurgeSurface(id: $id)
+  }
+`;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -181,7 +194,9 @@ type Permissions = { view: boolean; create: boolean; update: boolean; delete: bo
 type AdminUser = { id: string; name: string; isAdmin: boolean; roles: string[] };
 type RoleGrant = { surfaceId: string; surfaceTitle: string; permissions: Permissions };
 type RoleInfo = { id: string; name: string; grants: RoleGrant[] };
-type AdminSurface = { id: string; title: string; renderer: string; rootLabel: string; columnCount: number };
+type AdminSurface = { id: string; title: string; renderer: string; rootLabel: string; columnCount: number; deleted: boolean };
+
+const RENDERERS = ["table", "cards", "form", "board", "timeline"];
 
 const PERMISSION_LABELS: Array<[keyof Permissions, string]> = [
   ["view", "View"],
@@ -241,6 +256,8 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
   const [revoke] = useMutation(REVOKE);
   const [createSurface] = useMutation(CREATE_SURFACE);
   const [deleteSurface] = useMutation(DELETE_SURFACE);
+  const [restoreSurface] = useMutation(RESTORE_SURFACE);
+  const [purgeSurface] = useMutation(PURGE_SURFACE);
 
   const [notice, setNotice] = useState<string | null>(null);
   // dialogs
@@ -518,26 +535,52 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
               </TableHeader>
               <TableBody>
                 {surfaces.map((s) => (
-                  <TableRow key={s.id}>
-                    <TableCell className="font-medium">{s.title}</TableCell>
+                  <TableRow key={s.id} className={s.deleted ? "opacity-60" : ""}>
+                    <TableCell className="font-medium">
+                      {s.title}
+                      {s.deleted && <Badge variant="warning" className="ml-2">archived</Badge>}
+                    </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{s.id}</TableCell>
                     <TableCell><Badge variant="outline" className="font-mono">{s.rootLabel}</Badge></TableCell>
                     <TableCell>{s.renderer}</TableCell>
                     <TableCell>{s.columnCount}</TableCell>
                     <TableCell className="text-right">
                       <span className="inline-flex gap-1">
-                        <Button size="sm" variant="outline" onClick={() => onOpenSurface(s.id, s.title)}>
-                          Open
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="text-muted-foreground hover:text-destructive"
-                          onClick={() => run(() => deleteSurface({ variables: { id: s.id } }), `Deleted surface ${s.title}.`)}
-                          aria-label={`Delete surface ${s.title}`}
-                        >
-                          <Trash2 />
-                        </Button>
+                        {!s.deleted && (
+                          <Button size="sm" variant="outline" onClick={() => onOpenSurface(s.id, s.title)}>
+                            Open
+                          </Button>
+                        )}
+                        {!s.deleted ? (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="text-muted-foreground hover:text-destructive"
+                            onClick={() => run(() => deleteSurface({ variables: { id: s.id } }), `Archived ${s.title} (soft delete).`)}
+                            aria-label={`Archive surface ${s.title}`}
+                          >
+                            Archive
+                          </Button>
+                        ) : (
+                          <>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => run(() => restoreSurface({ variables: { id: s.id } }), `Restored ${s.title}.`)}
+                            >
+                              Restore
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="text-muted-foreground hover:text-destructive"
+                              onClick={() => run(() => purgeSurface({ variables: { id: s.id } }), `Permanently deleted ${s.title}.`)}
+                              aria-label={`Permanently delete ${s.title}`}
+                            >
+                              <Trash2 />
+                            </Button>
+                          </>
+                        )}
                       </span>
                     </TableCell>
                   </TableRow>
@@ -693,8 +736,15 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
                 <Input id="ns-root" placeholder="Project" value={newSurface.rootLabel} onChange={(e) => setNewSurface((p) => ({ ...p, rootLabel: e.target.value }))} />
               </div>
               <div className="grid gap-1.5">
-                <Label htmlFor="ns-renderer">Renderer</Label>
-                <Input id="ns-renderer" placeholder="table" value={newSurface.renderer} onChange={(e) => setNewSurface((p) => ({ ...p, renderer: e.target.value }))} />
+                <Label>Renderer</Label>
+                <Select value={newSurface.renderer} onValueChange={(v) => setNewSurface((p) => ({ ...p, renderer: v }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {RENDERERS.map((r) => (
+                      <SelectItem key={r} value={r}>{r}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
             <div className="grid gap-1.5">

@@ -56,8 +56,15 @@ carries a `source` that tells the projector where to pull the value from:
 | Source | Meaning | Example |
 | ------ | ------- | ------- |
 | `self.<prop>` | property on the row's root node | `self.budget` |
-| `<Label>.<prop>` | property of a *neighboring* node of that label | `Customer.name`, `Status.name`, `Role.name` |
+| `<Label>.<prop>` | property of a *neighboring* node of that label (any relationship) | `Customer.name`, `Status.name`, `Role.name` |
 | `<Label>.count` | number of neighboring nodes of that label | `Project.count` |
+| `>Rel:Label.<prop>` | property of a node reached via an **outgoing** typed relationship | `>HAS_STATUS:Status.name` |
+| `<Rel:Label.<prop>` | property of a node reached via an **incoming** typed relationship | `<HAS_PROJECT:Customer.name` |
+| `>Rel:Label.count` / `<Rel:Label.count` | count over a typed relationship | `<HAS_PROJECT:Project.count` |
+
+Typed sources make the relationship explicit, so **row writes** can create/relink
+those neighbors generically (any `Label.prop` column with a known relationship
+is writable — not just the hardcoded Customer/Status/Role set).
 
 Seeded examples of one surface mixing many node types:
 - **Project Overview** — rows are `Project` nodes; columns come from the
@@ -90,47 +97,72 @@ shares one source of options. New values are still allowed.
 
 `getSurface` returns `suggestions { field values }` for suggest-enabled columns.
 
+### 5. Renderer registry
+`Surface.renderer` is graph data; the frontend resolves it through a registry in
+`components/renderers/`:
+
+| renderer | what it shows |
+| -------- | ------------- |
+| `table` | editable DataTable (sorting, filter, inline edit, selection, Load more) |
+| `cards` | card grid with per-card selection |
+| `form` | record list + editable form (create/update) |
+| `board` | kanban lanes grouped by a status-like column |
+| `timeline` | vertical feed of records |
+
+Switch renderers from the **Manage surface** dialog or the admin surface
+creator; unknown renderer values fall back to the table with a notice.
+
+### 6. Paged rows
+`getSurface` returns metadata (columns/permissions/suggestions); rows come from
+`surfaceRows(surfaceId, first, after)` — a cursor connection
+(`edges { cursor node }`, `pageInfo`, `totalCount`) ordered by element id with
+cursor = base64 offset. The table shows *N of M* and a **Load more** button;
+CSV export pages through everything client-side.
+
+### 7. Guardrails
+- **Unique constraints** (created by `npm run seed`) on `User.id`, `Surface.id`,
+  `Column.id`, `Role.name`, `Customer.name`, `Status.name`, `Project.id`;
+  duplicate creates return friendly errors.
+- **Validation** at write time: `rootLabel` must be a valid label, `source` must
+  match one of the documented syntaxes, `renderer` must be in the registry.
+- **Soft delete** for surfaces: `adminDeleteSurface` archives (`deleted: true`),
+  `adminRestoreSurface` brings it back, `adminPurgeSurface` hard-deletes.
+  Archived surfaces are hidden from `getSurface`/`listSurfaces` and flagged in
+  the admin console.
+
 ## API surface
 
-`Query`: `me`, `getSurface` (incl. `suggestions`), `listSurfaces`, `adminUsers`, `adminRoles`, `adminSurfaces`
+`Query`: `me`, `getSurface` (incl. `suggestions`), `surfaceRows` (paged connection), `listSurfaces`, `adminUsers`, `adminRoles`, `adminSurfaces`
 `Mutation`:
 - rows: `createRow`, `updateRow`, `deleteRows` (generic over the surface's root label)
 - surface definitions: `updateSurface`, `addColumn`, `updateColumn`, `deleteColumn`
 - admin: `adminCreateUser`, `adminUpdateUser`, `adminDeleteUser`, `adminCreateRole`,
   `adminDeleteRole`, `adminAssignRole`, `adminRemoveRole`, `adminGrant`, `adminRevoke`,
   `adminSetOverride`, `adminClearOverride`, `adminCreateSurface`, `adminUpdateSurface`,
-  `adminDeleteSurface`
+  `adminDeleteSurface`, `adminRestoreSurface`, `adminPurgeSurface`
 
 ## Graph model
 
 ```
 (User)-[:HAS_ROLE]->(Role)-[:CAN_ACCESS {view,create,update,delete,export,manage}]->(Surface)
 (User)-[:SURFACE_OVERRIDE {view?,create?,...}]->(Surface)   // per-user boolean override
-(Surface)-[:HAS_COLUMN]->(Column {field,label,order,source,suggest,suggestSource})
+(Surface)-[:HAS_COLUMN]->(Column {field,label,order,source,suggest,suggestSource})  // source: self.prop | >Rel:Label.prop | <Rel:Label.prop | Label.count
 (Any root node, e.g. Project)-[:HAS_STATUS]->(Status)        // whatever the sources point at
 ```
 
-## Suggested next steps
+## Next steps
 
-See the feature request in the repo notes / conversation history; the highest-value
-items in order:
+Done in this round: renderer registry (3), generic typed-relationship writes (4),
+cursor paging (5), column reorder UI (6), guardrails incl. soft delete (7).
+
+Remaining:
 1. **Real auth** — replace the `x-user-id` demo header with verified JWT claims
    (Clerk/Auth0/Supabase) so `me` and the permission graph map to real sessions.
 2. **Row-level security** — surfaces are permission-gated per node type; add
    tenant/owner scoping (`WHERE` clauses from user context) when multiple
    organizations share the graph.
-3. **Renderer registry** — `Surface.renderer` is data but only `table` exists;
-   add `cards`, `form`, `board`, `timeline` renderer implementations.
-4. **Write routing for all sources** — row writes handle `self.*` + Customer/Status/Role
-   neighbors; extend the neighbor-link map or introduce a generic relationship
-   path syntax so any `Label.prop` column is writable.
-5. **Pagination & virtualisation** — the table renders all rows; move to
-   cursor/page-based GraphQL paging for large surfaces.
-6. **Column ordering/reordering UI** — order is stored in the graph; add
-   drag-to-reorder in the manage dialog.
-7. **Schema evolution guardrails** — unique constraints on node ids, validation
-   for `source`/`rootLabel` at surface-creation time, and a soft-delete for
-   surfaces instead of cascade delete.
+3. **Board drag-between-lanes** — lanes are display-only today; wire moving a
+   card to another lane to an `updateRow` on the grouping field.
 
 ## Production notes
 
