@@ -1,5 +1,5 @@
 node_modules
 .next
 .env.local
-neo4j/data
-neo4j/logs
+neo4j/
+tsconfig.tsbuildinfo

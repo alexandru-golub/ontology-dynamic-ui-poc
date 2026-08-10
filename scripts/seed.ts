@@ -1,46 +1,88 @@
 import { driver } from "../lib/neo4j";
 
+const clearQuery = `MATCH (n) DETACH DELETE n`;
+
 const query = `
-MERGE (acme:Organisation {id: 'acme'}) SET acme.name = 'Acme Corporation'
-MERGE (john:User {id: 'u1'}) SET john.email = 'john@example.com', john.name = 'John Editor'
-MERGE (john)-[:MEMBER_OF]->(acme)
-MERGE (editor:Role {id: 'editor'}) SET editor.name = 'editor'
-MERGE (john)-[:HAS_ROLE]->(editor)
-MERGE (customerType:EntityType {id: 'customer'}) SET customerType.name = 'Customer'
-MERGE (invoiceType:EntityType {id: 'invoice'}) SET invoiceType.name = 'Invoice'
-MERGE (customers:Surface {id: 'customers'})
-SET customers.name = 'Customers', customers.renderer = 'table', customers.icon = 'users',
-    customers.config = '{"columns":["name","email","status"],"search":["name","email"],"defaultSort":"name","actions":["create","edit","delete"]}'
-MERGE (customers)-[:USES]->(customerType)
-MERGE (editor)-[access:CAN_ACCESS]->(customers)
-SET access.read = true, access.create = true, access.update = true, access.delete = false
-MERGE (invoices:Surface {id: 'invoices'})
-SET invoices.name = 'Invoices', invoices.renderer = 'table', invoices.icon = 'receipt',
-    invoices.config = '{"columns":["number","total","status"],"search":["number","status"],"defaultSort":"number","actions":["create","edit","delete"]}'
-MERGE (invoices)-[:USES]->(invoiceType)
-MERGE (editor)-[invoiceAccess:CAN_ACCESS]->(invoices)
-SET invoiceAccess.read = true, invoiceAccess.create = true, invoiceAccess.update = true, invoiceAccess.delete = false
-MERGE (ada:Customer {id: 'c1'}) SET ada.name = 'Ada Lovelace', ada.email = 'ada@analytical.engine', ada.status = 'Active'
-MERGE (grace:Customer {id: 'c2'}) SET grace.name = 'Grace Hopper', grace.email = 'grace@navy.mil', grace.status = 'Active'
-MERGE (linus:Customer {id: 'c3'}) SET linus.name = 'Linus Torvalds', linus.email = 'linus@kernel.org', linus.status = 'Prospect'
-MERGE (ada)-[:BELONGS_TO]->(acme)
-MERGE (grace)-[:BELONGS_TO]->(acme)
-MERGE (linus)-[:BELONGS_TO]->(acme)
-MERGE (compiler:Project {id: 'p1'}) SET compiler.name = 'Compiler modernisation'
-MERGE (grace)-[:HAS_PROJECT]->(compiler)
-MERGE (invoice1:Invoice {id: 'i1'}) SET invoice1.number = 'INV-1001', invoice1.total = 2400.00, invoice1.status = 'Paid'
-MERGE (invoice2:Invoice {id: 'i2'}) SET invoice2.number = 'INV-1002', invoice2.total = 875.50, invoice2.status = 'Open'
-MERGE (invoice3:Invoice {id: 'i3'}) SET invoice3.number = 'INV-1003', invoice3.total = 1200.00, invoice3.status = 'Overdue'
-MERGE (ada)-[:HAS_INVOICE]->(invoice1)
-MERGE (grace)-[:HAS_INVOICE]->(invoice2)
-MERGE (linus)-[:HAS_INVOICE]->(invoice3)
+// ---- Users & roles -------------------------------------------------------
+CREATE (admin:User {id: 'admin_001', name: 'Ada Admin', isAdmin: true})
+CREATE (john:User {id: 'user_101', name: 'John Doe', isAdmin: false})-[:HAS_ROLE]->(sales:Role {id: 'role_sales', name: 'Sales'})
+CREATE (jane:User {id: 'user_202', name: 'Jane Smith', isAdmin: false})-[:HAS_ROLE]->(analyst:Role {id: 'role_analyst', name: 'Analyst'})
+CREATE (adminRole:Role {id: 'role_admin', name: 'Admin'})
+CREATE (admin)-[:HAS_ROLE]->(adminRole)
+
+// ---- Surfaces (UI planes defined in the graph) ---------------------------
+CREATE (projectsSurface:Surface {id: 'projects', title: 'Project Overview', name: 'Projects Matrix', renderer: 'table', rootLabel: 'Project'})
+CREATE (customersSurface:Surface {id: 'customers', title: 'Customer Portfolio', name: 'Customers', renderer: 'table', rootLabel: 'Customer'})
+CREATE (peopleSurface:Surface {id: 'people', title: 'People & Roles', name: 'People', renderer: 'table', rootLabel: 'User'})
+
+// Projects surface — rows are Projects; columns come from Project, Customer and Status nodes
+CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: 'Customer.name'})
+CREATE (c2:Column {id: 'col_project', field: 'project', label: 'Project Title', order: 2, source: 'self.name'})
+CREATE (c3:Column {id: 'col_status', field: 'status', label: 'Status', order: 3, source: 'Status.name'})
+CREATE (c4:Column {id: 'col_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner'})
+CREATE (c5:Column {id: 'col_budget', field: 'budget', label: 'Budget (USD)', order: 5, source: 'self.budget'})
+CREATE (projectsSurface)-[:HAS_COLUMN]->(c1)
+CREATE (projectsSurface)-[:HAS_COLUMN]->(c2)
+CREATE (projectsSurface)-[:HAS_COLUMN]->(c3)
+CREATE (projectsSurface)-[:HAS_COLUMN]->(c4)
+CREATE (projectsSurface)-[:HAS_COLUMN]->(c5)
+
+// Customers surface — rows are Customers; columns mix Customer props and counts/names of linked Projects
+CREATE (d1:Column {id: 'col2_customer', field: 'customer', label: 'Customer', order: 1, source: 'self.name'})
+CREATE (d2:Column {id: 'col2_projects', field: 'projects', label: 'Projects', order: 2, source: 'Project.count'})
+CREATE (d3:Column {id: 'col2_example', field: 'example', label: 'Example Project', order: 3, source: 'Project.name'})
+CREATE (d4:Column {id: 'col2_budget', field: 'budget', label: 'Largest Project Budget', order: 4, source: 'Project.budget'})
+CREATE (customersSurface)-[:HAS_COLUMN]->(d1)
+CREATE (customersSurface)-[:HAS_COLUMN]->(d2)
+CREATE (customersSurface)-[:HAS_COLUMN]->(d3)
+CREATE (customersSurface)-[:HAS_COLUMN]->(d4)
+
+// People surface — rows are Users; columns mix User props and their Role names
+CREATE (e1:Column {id: 'col3_user', field: 'user', label: 'Name', order: 1, source: 'self.name'})
+CREATE (e2:Column {id: 'col3_role', field: 'role', label: 'Role', order: 2, source: 'Role.name'})
+CREATE (e3:Column {id: 'col3_admin', field: 'admin', label: 'Admin', order: 3, source: 'self.isAdmin'})
+CREATE (peopleSurface)-[:HAS_COLUMN]->(e1)
+CREATE (peopleSurface)-[:HAS_COLUMN]->(e2)
+CREATE (peopleSurface)-[:HAS_COLUMN]->(e3)
+
+// ---- Business data -------------------------------------------------------
+CREATE (acme:Customer {id: 'customer_acme', name: 'Acme Corp'})
+CREATE (globex:Customer {id: 'customer_globex', name: 'Globex'})
+CREATE (initech:Customer {id: 'customer_initech', name: 'Initech'})
+CREATE (project1:Project {id: 'project_redesign', name: 'Website Redesign', owner: 'John Doe', budget: 24000})
+CREATE (project2:Project {id: 'project_app', name: 'Mobile App', owner: 'Jane Smith', budget: 68000})
+CREATE (project3:Project {id: 'project_platform', name: 'Data Platform', owner: 'Ada Admin', budget: 120000})
+CREATE (active:Status {id: 'status_active', name: 'Active'})
+CREATE (draft:Status {id: 'status_draft', name: 'Draft'})
+CREATE (done:Status {id: 'status_done', name: 'Done'})
+CREATE (acme)-[:HAS_PROJECT]->(project1)
+CREATE (project1)-[:HAS_STATUS]->(active)
+CREATE (globex)-[:HAS_PROJECT]->(project2)
+CREATE (project2)-[:HAS_STATUS]->(draft)
+CREATE (acme)-[:HAS_PROJECT]->(project3)
+CREATE (project3)-[:HAS_STATUS]->(done)
+
+// ---- Permissions ---------------------------------------------------------
+// John (Sales): full row CRUD on projects (delete via override), manage on customers.
+CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(projectsSurface)
+CREATE (john)-[:SURFACE_OVERRIDE {delete: true}]->(projectsSurface)
+CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: true, export: true, manage: true}]->(customersSurface)
+
+// Jane (Analyst): read-only + export everywhere.
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(projectsSurface)
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(customersSurface)
+
+// Everyone can view People & Roles; only admins (flag) can manage users there.
+CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
 `;
 
 async function seed() {
   const session = driver.session();
   try {
+    await session.run(clearQuery);
     await session.run(query);
-    console.log("Seeded John, editor permissions, Customers surface, and sample customers.");
+    console.log("Seeded admin, 2 demo users, 3 multi-source surfaces and permissions.");
   } finally {
     await session.close();
     await driver.close();
