@@ -16,10 +16,10 @@ CREATE (customersSurface:Surface {id: 'customers', title: 'Customer Portfolio', 
 CREATE (peopleSurface:Surface {id: 'people', title: 'People & Roles', name: 'People', renderer: 'table', rootLabel: 'User'})
 
 // Projects surface — rows are Projects; columns come from Project, Customer and Status nodes
-CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: 'Customer.name'})
+CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: 'Customer.name', suggest: true})
 CREATE (c2:Column {id: 'col_project', field: 'project', label: 'Project Title', order: 2, source: 'self.name'})
-CREATE (c3:Column {id: 'col_status', field: 'status', label: 'Status', order: 3, source: 'Status.name'})
-CREATE (c4:Column {id: 'col_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner'})
+CREATE (c3:Column {id: 'col_status', field: 'status', label: 'Status', order: 3, source: 'Status.name', suggest: true})
+CREATE (c4:Column {id: 'col_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner', suggest: true})
 CREATE (c5:Column {id: 'col_budget', field: 'budget', label: 'Budget (USD)', order: 5, source: 'self.budget'})
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c1)
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c2)
@@ -28,7 +28,7 @@ CREATE (projectsSurface)-[:HAS_COLUMN]->(c4)
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c5)
 
 // Customers surface — rows are Customers; columns mix Customer props and counts/names of linked Projects
-CREATE (d1:Column {id: 'col2_customer', field: 'customer', label: 'Customer', order: 1, source: 'self.name'})
+CREATE (d1:Column {id: 'col2_customer', field: 'customer', label: 'Customer', order: 1, source: 'self.name', suggest: true})
 CREATE (d2:Column {id: 'col2_projects', field: 'projects', label: 'Projects', order: 2, source: 'Project.count'})
 CREATE (d3:Column {id: 'col2_example', field: 'example', label: 'Example Project', order: 3, source: 'Project.name'})
 CREATE (d4:Column {id: 'col2_budget', field: 'budget', label: 'Largest Project Budget', order: 4, source: 'Project.budget'})
@@ -39,7 +39,7 @@ CREATE (customersSurface)-[:HAS_COLUMN]->(d4)
 
 // People surface — rows are Users; columns mix User props and their Role names
 CREATE (e1:Column {id: 'col3_user', field: 'user', label: 'Name', order: 1, source: 'self.name'})
-CREATE (e2:Column {id: 'col3_role', field: 'role', label: 'Role', order: 2, source: 'Role.name'})
+CREATE (e2:Column {id: 'col3_role', field: 'role', label: 'Role', order: 2, source: 'Role.name', suggest: true})
 CREATE (e3:Column {id: 'col3_admin', field: 'admin', label: 'Admin', order: 3, source: 'self.isAdmin'})
 CREATE (peopleSurface)-[:HAS_COLUMN]->(e1)
 CREATE (peopleSurface)-[:HAS_COLUMN]->(e2)

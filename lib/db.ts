@@ -7,11 +7,20 @@ import { driver } from "./neo4j";
 // Types
 // ---------------------------------------------------------------------------
 export type Permissions = Record<"view" | "create" | "update" | "delete" | "export" | "manage", boolean>;
-export type Column = { id: string; field: string; label: string; order: number; source: string | null };
+export type Column = {
+  id: string;
+  field: string;
+  label: string;
+  order: number;
+  source: string | null;
+  suggest: boolean;
+  suggestSource: string | null;
+};
 export type SurfaceMeta = { id: string; title: string; renderer: string; rootLabel: string; columns: Column[] };
 export type SurfaceRow = { id: string; values: Record<string, unknown> };
 
 const ALL_TRUE: Permissions = { view: true, create: true, update: true, delete: true, export: true, manage: true };
+const ALL_FALSE: Permissions = { view: false, create: false, update: false, delete: false, export: false, manage: false };
 const PERMISSION_KEYS = ["view", "create", "update", "delete", "export", "manage"] as const;
 
 /** Relationship map used by generic row writes: neighbor label -> how to link it. */
@@ -74,7 +83,7 @@ RETURN s.id AS id,
        coalesce(s.title, s.name) AS title,
        s.renderer AS renderer,
        coalesce(s.rootLabel, 'Project') AS rootLabel,
-       [c IN collect(column) WHERE c IS NOT NULL | { id: elementId(c), field: c.field, label: c.label, order: toInteger(c.order), source: c.source }] AS columns`;
+       [c IN collect(column) WHERE c IS NOT NULL | { id: elementId(c), field: c.field, label: c.label, order: toInteger(c.order), source: c.source, suggest: coalesce(c.suggest, false), suggestSource: c.suggestSource }] AS columns`;
 
 export async function getSurfaceMeta(surfaceId: string): Promise<SurfaceMeta> {
   const session = driver.session({ defaultAccessMode: "READ" });
@@ -400,11 +409,53 @@ ORDER BY s.id`,
   }
 }
 
+/**
+ * Distinct existing values for every column with `suggest` enabled.
+ * For neighbor sources it pulls from the neighbor label (e.g. all Customer
+ * names), for self sources from the surface's root label — so suggestions are
+ * not limited to rows currently visible in this surface.
+ */
+export async function getSuggestions(surface: SurfaceMeta): Promise<Array<{ field: string; values: string[] }>> {
+  const groups: Array<{ field: string; label: string; prop: string }> = [];
+  for (const column of surface.columns) {
+    if (!column.suggest) continue;
+    const source = parseSource(column.source, column.field);
+    if (source.kind === "count") continue;
+    const label = column.suggestSource ?? (source.kind === "neighbor" ? source.label : surface.rootLabel);
+    groups.push({ field: column.field, label, prop: source.prop });
+  }
+  if (groups.length === 0) return [];
+  const session = driver.session({ defaultAccessMode: "READ" });
+  try {
+    const results: Array<{ field: string; values: string[] }> = [];
+    for (const group of groups) {
+      const label = sanitizeLabel(group.label);
+      const result = await session.run(
+        `MATCH (n:\`${label}\`) WHERE n[$prop] IS NOT NULL AND toString(n[$prop]) <> '' RETURN DISTINCT toString(n[$prop]) AS v ORDER BY v LIMIT 100`,
+        { prop: group.prop },
+      );
+      results.push({ field: group.field, values: result.records.map((record) => record.get("v") as string) });
+    }
+    return results;
+  } finally {
+    await session.close();
+  }
+}
+
 export async function getSurfacePayload(userId: string, surfaceId: string) {
   const permissions = await requirePermission(userId, surfaceId, "view");
   const surface = await getSurfaceMeta(surfaceId);
-  const rows = await runSurfaceRows(surface);
-  return { id: surface.id, title: surface.title, renderer: surface.renderer, rootLabel: surface.rootLabel, columns: surface.columns, permissions, rows };
+  const [rows, suggestions] = await Promise.all([runSurfaceRows(surface), getSuggestions(surface)]);
+  return {
+    id: surface.id,
+    title: surface.title,
+    renderer: surface.renderer,
+    rootLabel: surface.rootLabel,
+    columns: surface.columns,
+    permissions,
+    rows,
+    suggestions,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +498,7 @@ ORDER BY r.name`,
         name: obj.name,
         grants: (obj.grants as Array<Record<string, unknown>>).map((grant) => ({
           ...grant,
-          permissions: { ...ALL_TRUE, ...(toPlain(grant.permissions) as Permissions) },
+          permissions: { ...ALL_FALSE, ...(toPlain(grant.permissions) as Permissions) },
         })),
       };
     });
@@ -602,7 +653,7 @@ RETURN coalesce(r.id, r.name) AS id, r.name AS name, grants`,
       name: obj.name,
       grants: (obj.grants as Array<Record<string, unknown>>).map((grant) => ({
         ...grant,
-        permissions: { ...ALL_TRUE, ...(toPlain(grant.permissions) as Permissions) },
+        permissions: { ...ALL_FALSE, ...(toPlain(grant.permissions) as Permissions) },
       })),
     };
   } finally {
@@ -667,7 +718,7 @@ export async function adminCreateSurface(input: {
   title: string;
   renderer?: string;
   rootLabel?: string;
-  columns?: Array<{ field: string; label: string; order?: number; source?: string }>;
+  columns?: Array<{ field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string }>;
 }) {
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
@@ -678,7 +729,7 @@ export async function adminCreateSurface(input: {
     for (const [index, column] of (input.columns ?? []).entries()) {
       await session.run(
         `MATCH (s:Surface {id: $id})
-         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source})
+         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source, suggest: $suggest, suggestSource: $suggestSource})
          CREATE (s)-[:HAS_COLUMN]->(c)`,
         {
           id: input.id,
@@ -687,6 +738,8 @@ export async function adminCreateSurface(input: {
           label: column.label,
           order: column.order ?? index + 1,
           source: column.source ?? null,
+          suggest: column.suggest ?? false,
+          suggestSource: column.suggestSource ?? null,
         },
       );
     }

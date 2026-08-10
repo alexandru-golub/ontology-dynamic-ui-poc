@@ -6,10 +6,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { SuggestInput } from "@/components/suggest-input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 
-export type TableColumn = { id?: string; field: string; label: string; order: number; source?: string | null };
+export type TableColumn = { id?: string; field: string; label: string; order: number; source?: string | null; suggest?: boolean; suggestSource?: string | null };
 export type TableRowData = { id: string; values: Record<string, unknown> };
 
 type SortState = { field: string; dir: "asc" | "desc" } | null;
@@ -97,11 +98,12 @@ export function DataTable({
     setDraft(String(row.values[field] ?? ""));
   };
 
-  const commitEdit = async () => {
+  const commitEdit = async (finalValue?: string) => {
     if (!editCell) return;
     const cell = editCell;
+    const next = finalValue ?? draft;
     setEditCell(null);
-    await onUpdate?.(cell.rowId, { [cell.field]: draft });
+    await onUpdate?.(cell.rowId, { [cell.field]: next });
   };
 
   return (
@@ -182,11 +184,20 @@ export function DataTable({
                       onDoubleClick={() => beginEdit(row, column.field)}
                     >
                       {editing ? (
-                        <div className="flex items-center gap-1">
+                        suggestionsFor && suggestionsFor.length > 0 ? (
+                          <SuggestInput
+                            autoFocus
+                            value={draft}
+                            onChange={setDraft}
+                            onCommit={(v) => void commitEdit(v)}
+                            onCancel={() => setEditCell(null)}
+                            suggestions={suggestionsFor}
+                            className="h-8"
+                          />
+                        ) : (
                           <Input
                             autoFocus
                             value={draft}
-                            list={suggestionsFor ? `dl-${column.field}` : undefined}
                             onChange={(event) => setDraft(event.target.value)}
                             onKeyDown={(event) => {
                               if (event.key === "Enter") void commitEdit();
@@ -195,14 +206,7 @@ export function DataTable({
                             onBlur={() => void commitEdit()}
                             className="h-8"
                           />
-                          {suggestionsFor && (
-                            <datalist id={`dl-${column.field}`}>
-                              {suggestionsFor.map((s) => (
-                                <option key={s} value={s} />
-                              ))}
-                            </datalist>
-                          )}
-                        </div>
+                        )
                       ) : (
                         formatValue(value)
                       )}

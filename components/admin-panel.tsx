@@ -194,6 +194,16 @@ const PERMISSION_LABELS: Array<[keyof Permissions, string]> = [
 
 const EMPTY_PERMS: Permissions = { view: false, create: false, update: false, delete: false, export: false, manage: false };
 
+/** Extract only the six permission keys (query results carry Apollo __typename). */
+function pickPerms(source?: Partial<Permissions> | null): Permissions {
+  const out = { ...EMPTY_PERMS };
+  for (const [key] of PERMISSION_LABELS) {
+    const value = source?.[key];
+    if (typeof value === "boolean") out[key] = value;
+  }
+  return out;
+}
+
 function grantSummary(grants: RoleGrant[]) {
   if (grants.length === 0) return <span className="text-muted-foreground">no grants</span>;
   return (
@@ -263,12 +273,12 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
     setGrantsFor(role);
     const first = role.grants[0];
     setGrantSurface(first?.surfaceId ?? "");
-    setGrantPerms(first ? { ...EMPTY_PERMS, ...first.permissions } : { ...EMPTY_PERMS });
+    setGrantPerms(pickPerms(first?.permissions));
   };
 
   const saveGrant = async () => {
     if (!grantsFor || !grantSurface) return;
-    await run(() => grant({ variables: { roleName: grantsFor.name, surfaceId: grantSurface, permissions: grantPerms } }), "Grant saved.");
+    await run(() => grant({ variables: { roleName: grantsFor.name, surfaceId: grantSurface, permissions: pickPerms(grantPerms) } }), "Grant saved.");
     setGrantsFor(null);
   };
 
@@ -315,8 +325,15 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => {
-        const [field, label, source, order] = line.split("|").map((s) => s?.trim());
-        return { field, label, source: source || undefined, order: order ? Number(order) : undefined };
+        // field|label|source|order|suggest(yes/no)
+        const [field, label, source, order, suggest] = line.split("|").map((s) => s?.trim());
+        return {
+          field,
+          label,
+          source: source || undefined,
+          order: order ? Number(order) : undefined,
+          suggest: ["yes", "1", "true"].includes((suggest ?? "").toLowerCase()),
+        };
       })
       .filter((c) => c.field && c.label);
     if (!newSurface.id.trim() || !newSurface.title.trim()) return setNotice("Surface id and title are required.");
@@ -616,7 +633,7 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
                 onValueChange={(value) => {
                   setGrantSurface(value);
                   const existing = grantsFor?.grants.find((g) => g.surfaceId === value);
-                  setGrantPerms(existing ? { ...EMPTY_PERMS, ...existing.permissions } : { ...EMPTY_PERMS });
+                  setGrantPerms(pickPerms(existing?.permissions));
                 }}
               >
                 <SelectTrigger><SelectValue placeholder="Choose a surface" /></SelectTrigger>
@@ -682,12 +699,12 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="ns-columns">
-                Columns — one per line: <code className="text-xs">field|label|source</code>
+                Columns — one per line: <code className="text-xs">field|label|source|order|suggest</code>
               </Label>
               <textarea
                 id="ns-columns"
                 className="flex min-h-[110px] w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                placeholder={"customer|Customer Name|Customer.name\nproject|Project|self.name\nstatus|Status|Status.name\nowners|Owners|Owner.count"}
+                placeholder={"customer|Customer Name|Customer.name|1|yes\nproject|Project|self.name|2\nstatus|Status|Status.name|3|yes\nowners|Owners|Owner.count|4"}
                 value={newSurface.columns}
                 onChange={(e) => setNewSurface((p) => ({ ...p, columns: e.target.value }))}
               />

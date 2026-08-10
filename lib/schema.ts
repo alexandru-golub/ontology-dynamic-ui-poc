@@ -46,6 +46,13 @@ type ColumnMetadata {
   label: String!
   order: Int!
   source: String
+  suggest: Boolean!
+  suggestSource: String
+}
+
+type SuggestionGroup {
+  field: String!
+  values: [String!]!
 }
 
 type SurfacePermissions {
@@ -70,6 +77,7 @@ type SurfacePayload {
   columns: [ColumnMetadata!]!
   permissions: SurfacePermissions!
   rows: [SurfaceRow!]!
+  suggestions: [SuggestionGroup!]!
 }
 
 type SurfaceSummary {
@@ -123,6 +131,8 @@ input ColumnInput {
   label: String!
   order: Int
   source: String
+  suggest: Boolean
+  suggestSource: String
 }
 
 input ColumnPatchInput {
@@ -130,6 +140,8 @@ input ColumnPatchInput {
   label: String
   order: Int
   source: String
+  suggest: Boolean
+  suggestSource: String
 }
 
 input PermissionInput {
@@ -295,12 +307,7 @@ export function getSchema(userId: string) {
   };
 
   // ---------------- Surface definition CRUD ----------------
-  const refreshSurfacePayload = async (surfaceId: string) => {
-    const permissions = await requirePermission(userId, surfaceId, "view");
-    const surface = await getSurfaceMeta(surfaceId);
-    const rows = await runSurfaceRows(surface);
-    return { id: surface.id, title: surface.title, renderer: surface.renderer, rootLabel: surface.rootLabel, columns: surface.columns, permissions, rows };
-  };
+  const refreshSurfacePayload = async (surfaceId: string) => getSurfacePayload(userId, surfaceId);
 
   mutationType.getFields().updateSurface.resolve = async (
     _source,
@@ -322,7 +329,7 @@ export function getSchema(userId: string) {
 
   mutationType.getFields().addColumn.resolve = async (
     _source,
-    { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string } },
+    { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
     const surface = await getSurfaceMeta(surfaceId);
@@ -331,7 +338,7 @@ export function getSchema(userId: string) {
     try {
       await session.run(
         `MATCH (s:Surface {id: $surfaceId})
-         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source})
+         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source, suggest: $suggest, suggestSource: $suggestSource})
          CREATE (s)-[:HAS_COLUMN]->(c)`,
         {
           surfaceId,
@@ -340,6 +347,8 @@ export function getSchema(userId: string) {
           label: input.label,
           order,
           source: input.source ?? null,
+          suggest: input.suggest ?? false,
+          suggestSource: input.suggestSource ?? null,
         },
       );
     } finally {
@@ -350,15 +359,16 @@ export function getSchema(userId: string) {
 
   mutationType.getFields().updateColumn.resolve = async (
     _source,
-    { surfaceId, columnId, input }: { surfaceId: string; columnId: string; input: { field?: string; label?: string; order?: number; source?: string } },
+    { surfaceId, columnId, input }: { surfaceId: string; columnId: string; input: { field?: string; label?: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
     const session = driver.session({ defaultAccessMode: "WRITE" });
     try {
       await session.run(
         `MATCH (c:Column) WHERE elementId(c) = $columnId
-         SET c.field = coalesce($field, c.field), c.label = coalesce($label, c.label), c.order = coalesce($order, c.order), c.source = coalesce($source, c.source)`,
-        { columnId, field: input.field ?? null, label: input.label ?? null, order: input.order ?? null, source: input.source ?? null },
+         SET c.field = coalesce($field, c.field), c.label = coalesce($label, c.label), c.order = coalesce($order, c.order),
+             c.source = coalesce($source, c.source), c.suggest = coalesce($suggest, c.suggest), c.suggestSource = coalesce($suggestSource, c.suggestSource)`,
+        { columnId, field: input.field ?? null, label: input.label ?? null, order: input.order ?? null, source: input.source ?? null, suggest: input.suggest ?? null, suggestSource: input.suggestSource ?? null },
       );
     } finally {
       await session.close();

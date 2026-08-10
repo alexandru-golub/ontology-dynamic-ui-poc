@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { SuggestInput } from "@/components/suggest-input";
 import { Label } from "@/components/ui/label";
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,8 @@ const GET_SURFACE = gql`
         label
         order
         source
+        suggest
+        suggestSource
       }
       permissions {
         view
@@ -45,6 +48,10 @@ const GET_SURFACE = gql`
       }
       rows {
         id
+        values
+      }
+      suggestions {
+        field
         values
       }
     }
@@ -101,6 +108,14 @@ const DELETE_COLUMN = gql`
   }
 `;
 
+const UPDATE_COLUMN = gql`
+  mutation UpdateColumn($surfaceId: ID!, $columnId: ID!, $input: ColumnPatchInput!) {
+    updateColumn(surfaceId: $surfaceId, columnId: $columnId, input: $input) {
+      id
+    }
+  }
+`;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -120,6 +135,7 @@ type SurfacePayload = {
   columns: TableColumn[];
   permissions: Permissions;
   rows: TableRowData[];
+  suggestions: Array<{ field: string; values: string[] }>;
 };
 
 function csvEscape(value: unknown): string {
@@ -154,6 +170,7 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
   const [deleteRows] = useMutation(DELETE_ROWS);
   const [updateSurface] = useMutation(UPDATE_SURFACE);
   const [addColumn] = useMutation(ADD_COLUMN);
+  const [updateColumn] = useMutation(UPDATE_COLUMN);
   const [deleteColumn] = useMutation(DELETE_COLUMN);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -163,20 +180,13 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
   const [createValues, setCreateValues] = useState<Record<string, string>>({});
   const [titleDraft, setTitleDraft] = useState("");
   const [rootDraft, setRootDraft] = useState("");
-  const [columnDraft, setColumnDraft] = useState({ field: "", label: "", source: "", order: "" });
+  const [columnDraft, setColumnDraft] = useState({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "" });
 
   const surface = data?.getSurface;
 
   const suggestions = useMemo(() => {
     const map: Record<string, string[]> = {};
-    for (const column of surface?.columns ?? []) {
-      const values = new Set<string>();
-      for (const row of surface?.rows ?? []) {
-        const v = row.values[column.field];
-        if (typeof v === "string" && v) values.add(v);
-      }
-      if (values.size) map[column.field] = [...values].sort();
-    }
+    for (const group of surface?.suggestions ?? []) map[group.field] = group.values;
     return map;
   }, [surface]);
 
@@ -256,14 +266,26 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
             label: columnDraft.label.trim(),
             source: columnDraft.source.trim() || undefined,
             order: columnDraft.order ? Number(columnDraft.order) : null,
+            suggest: columnDraft.suggest,
+            suggestSource: columnDraft.suggestSource.trim() || undefined,
           },
         },
       });
-      setColumnDraft({ field: "", label: "", source: "", order: "" });
+      setColumnDraft({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "" });
       setNotice(`Column "${columnDraft.field}" added.`);
       await refetch();
     } catch (err) {
       setNotice(`Add column failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const toggleSuggest = async (columnId: string, field: string, suggest: boolean) => {
+    try {
+      await updateColumn({ variables: { surfaceId, columnId, input: { suggest } } });
+      setNotice(suggest ? `Suggestions enabled for "${field}".` : `Suggestions disabled for "${field}".`);
+      await refetch();
+    } catch (err) {
+      setNotice(`Toggle failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -362,20 +384,25 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                 <div key={column.field} className="grid gap-1.5">
                   <Label htmlFor={`create-${column.field}`}>
                     {column.label}
-                    <span className="ml-2 font-mono text-[10px] text-muted-foreground">{column.source ?? column.field}</span>
+                    <span className="ml-2 font-mono text-[10px] text-muted-foreground">
+                      {column.source ?? column.field}
+                      {column.suggest ? " · suggest" : ""}
+                    </span>
                   </Label>
-                  <Input
-                    id={`create-${column.field}`}
-                    value={createValues[column.field] ?? ""}
-                    onChange={(event) => setCreateValues((prev) => ({ ...prev, [column.field]: event.target.value }))}
-                    list={suggestions[column.field] ? `create-dl-${column.field}` : undefined}
-                  />
-                  {suggestions[column.field] && (
-                    <datalist id={`create-dl-${column.field}`}>
-                      {suggestions[column.field].map((s) => (
-                        <option key={s} value={s} />
-                      ))}
-                    </datalist>
+                  {suggestions[column.field] ? (
+                    <SuggestInput
+                      id={`create-${column.field}`}
+                      value={createValues[column.field] ?? ""}
+                      onChange={(v) => setCreateValues((prev) => ({ ...prev, [column.field]: v }))}
+                      onCommit={() => undefined}
+                      suggestions={suggestions[column.field]}
+                    />
+                  ) : (
+                    <Input
+                      id={`create-${column.field}`}
+                      value={createValues[column.field] ?? ""}
+                      onChange={(event) => setCreateValues((prev) => ({ ...prev, [column.field]: event.target.value }))}
+                    />
                   )}
                 </div>
               ))}
@@ -420,22 +447,36 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                 {[...surface.columns]
                   .sort((a, b) => a.order - b.order)
                   .map((column) => (
-                    <div key={column.id ?? column.field} className="flex items-center justify-between rounded px-2 py-1 text-sm hover:bg-muted">
-                      <span>
+                    <div key={column.id ?? column.field} className="flex items-center justify-between gap-2 rounded px-2 py-1 text-sm hover:bg-muted">
+                      <span className="min-w-0">
                         {column.label}{" "}
                         <span className="font-mono text-[11px] text-muted-foreground">
                           {column.field} · {column.source ?? "self." + column.field} · #{column.order}
                         </span>
+                        {column.suggest && (
+                          <span className="ml-1 rounded bg-primary/15 px-1 py-0.5 text-[10px] font-semibold text-primary">suggest</span>
+                        )}
                       </span>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-6 w-6 text-muted-foreground hover:text-destructive"
-                        onClick={() => column.id && void submitDeleteColumn(column.id, column.field)}
-                        aria-label={`Delete column ${column.label}`}
-                      >
-                        <X />
-                      </Button>
+                      <span className="flex shrink-0 items-center gap-2">
+                        <label className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(column.suggest)}
+                            onChange={(event) => column.id && void toggleSuggest(column.id, column.field, event.target.checked)}
+                            className="h-3.5 w-3.5 accent-[var(--primary)]"
+                          />
+                          suggest
+                        </label>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                          onClick={() => column.id && void submitDeleteColumn(column.id, column.field)}
+                          aria-label={`Delete column ${column.label}`}
+                        >
+                          <X />
+                        </Button>
+                      </span>
                     </div>
                   ))}
                 {surface.columns.length === 0 && <p className="px-2 py-1 text-sm text-muted-foreground">No columns yet.</p>}
@@ -444,7 +485,7 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
 
             <div className="grid gap-1.5">
               <Label className="mb-1 block">Add column</Label>
-              <div className="grid grid-cols-[1fr_1fr_1fr_64px] gap-2">
+              <div className="grid grid-cols-[1fr_1fr_1fr_1fr_64px] gap-2">
                 <Input
                   placeholder="field"
                   value={columnDraft.field}
@@ -461,12 +502,26 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                   onChange={(e) => setColumnDraft((p) => ({ ...p, source: e.target.value }))}
                 />
                 <Input
+                  placeholder="suggest from (optional)"
+                  value={columnDraft.suggestSource}
+                  onChange={(e) => setColumnDraft((p) => ({ ...p, suggestSource: e.target.value }))}
+                />
+                <Input
                   placeholder="#"
                   type="number"
                   value={columnDraft.order}
                   onChange={(e) => setColumnDraft((p) => ({ ...p, order: e.target.value }))}
                 />
               </div>
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={columnDraft.suggest}
+                  onChange={(e) => setColumnDraft((p) => ({ ...p, suggest: e.target.checked }))}
+                  className="h-3.5 w-3.5 accent-[var(--primary)]"
+                />
+                Recommend existing values while typing (per-field, on/off)
+              </label>
               <div className="mt-1 flex justify-end">
                 <Button size="sm" variant="secondary" onClick={() => void submitAddColumn()}>
                   <Plus /> Add column
