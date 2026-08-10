@@ -32,7 +32,7 @@ Open http://localhost:3000. Neo4j Browser: http://localhost:7477 (neo4j / local-
 | John Doe (`user_101`) | Sales | Row CRUD on Project Overview (delete via override), manage on Customer Portfolio |
 | Jane Smith (`user_202`) | Analyst | Read-only + export everywhere |
 
-## The three ideas
+## The ideas
 
 ### 1. Admin console
 A super-privileged user (`User.isAdmin = true`) bypasses all permission checks
@@ -70,9 +70,29 @@ Seeded examples of one surface mixing many node types:
 
 Adding a column with a new source is a graph write — no frontend code needed.
 
+### 4. Per-field value suggestions
+Every column can turn **existing-value suggestions** on or off
+(`Column.suggest`), independently for each field — set it when creating the
+surface, or toggle it any time from the **Manage surface** dialog.
+
+When enabled, editing that field (inline in the table or in the Add-row dialog)
+opens a combobox that **recommends existing values as you type**: e.g. typing
+`Ac` in *Customer Name* on Project Overview suggests `Acme Corp`. Suggestions
+are pulled from the underlying node label (all `Customer` nodes — not just the
+rows visible in the current surface), so the same field on different surfaces
+shares one source of options. New values are still allowed.
+
+| Control | Meaning |
+| ------- | ------- |
+| `Column.suggest` | on/off for the field |
+| `Column.suggestSource` | optional node label to draw options from (defaults to the column's neighbor label, or the surface root label for `self.*` sources) |
+| Admin surface creator | columns line format `field|label|source|order|suggest`, e.g. `customer|Customer Name|Customer.name|2|yes` |
+
+`getSurface` returns `suggestions { field values }` for suggest-enabled columns.
+
 ## API surface
 
-`Query`: `me`, `getSurface`, `listSurfaces`, `adminUsers`, `adminRoles`, `adminSurfaces`
+`Query`: `me`, `getSurface` (incl. `suggestions`), `listSurfaces`, `adminUsers`, `adminRoles`, `adminSurfaces`
 `Mutation`:
 - rows: `createRow`, `updateRow`, `deleteRows` (generic over the surface's root label)
 - surface definitions: `updateSurface`, `addColumn`, `updateColumn`, `deleteColumn`
@@ -86,9 +106,31 @@ Adding a column with a new source is a graph write — no frontend code needed.
 ```
 (User)-[:HAS_ROLE]->(Role)-[:CAN_ACCESS {view,create,update,delete,export,manage}]->(Surface)
 (User)-[:SURFACE_OVERRIDE {view?,create?,...}]->(Surface)   // per-user boolean override
-(Surface)-[:HAS_COLUMN]->(Column {field,label,order,source})
+(Surface)-[:HAS_COLUMN]->(Column {field,label,order,source,suggest,suggestSource})
 (Any root node, e.g. Project)-[:HAS_STATUS]->(Status)        // whatever the sources point at
 ```
+
+## Suggested next steps
+
+See the feature request in the repo notes / conversation history; the highest-value
+items in order:
+1. **Real auth** — replace the `x-user-id` demo header with verified JWT claims
+   (Clerk/Auth0/Supabase) so `me` and the permission graph map to real sessions.
+2. **Row-level security** — surfaces are permission-gated per node type; add
+   tenant/owner scoping (`WHERE` clauses from user context) when multiple
+   organizations share the graph.
+3. **Renderer registry** — `Surface.renderer` is data but only `table` exists;
+   add `cards`, `form`, `board`, `timeline` renderer implementations.
+4. **Write routing for all sources** — row writes handle `self.*` + Customer/Status/Role
+   neighbors; extend the neighbor-link map or introduce a generic relationship
+   path syntax so any `Label.prop` column is writable.
+5. **Pagination & virtualisation** — the table renders all rows; move to
+   cursor/page-based GraphQL paging for large surfaces.
+6. **Column ordering/reordering UI** — order is stored in the graph; add
+   drag-to-reorder in the manage dialog.
+7. **Schema evolution guardrails** — unique constraints on node ids, validation
+   for `source`/`rootLabel` at surface-creation time, and a soft-delete for
+   surfaces instead of cascade delete.
 
 ## Production notes
 
