@@ -45,7 +45,7 @@ All `admin*` GraphQL mutations are guarded by `requireAdmin` server-side — the
 UI hiding is not the security boundary.
 
 ### 2. shadcn/ui
-MUI was removed entirely (bundle: 249 kB → 69 kB for the page). Components live
+MUI was removed entirely (page bundle: 249 kB → ~73 kB). Components live
 in `components/ui/*` (button, dialog, select, tabs, checkbox, table, badge,
 alert, card, input, label, textarea) built on Radix primitives + Tailwind v4.
 
