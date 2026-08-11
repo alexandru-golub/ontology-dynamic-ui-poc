@@ -235,7 +235,7 @@ type RoleGrant = { surfaceId: string; surfaceTitle: string; permissions: Permiss
 type RoleInfo = { id: string; name: string; grants: RoleGrant[] };
 type AdminSurface = { id: string; title: string; renderer: string; rootLabel: string; columnCount: number; deleted: boolean };
 
-const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt"];
+const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt", "calendar"];
 
 const PERMISSION_LABELS: Array<[keyof Permissions, string]> = [
   ["view", "View"],

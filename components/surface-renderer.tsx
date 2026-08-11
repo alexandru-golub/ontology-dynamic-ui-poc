@@ -150,7 +150,7 @@ const UPDATE_COLUMN = gql`
   }
 `;
 
-const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt"];
+const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt", "calendar"];
 const PAGE_SIZE = 50;
 
 type SurfaceRowsData = {

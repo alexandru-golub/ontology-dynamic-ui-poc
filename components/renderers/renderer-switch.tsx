@@ -2,6 +2,7 @@
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { BoardRenderer } from "./board-renderer";
+import { CalendarRenderer } from "./calendar-renderer";
 import { CardsRenderer } from "./cards-renderer";
 import { DataTableRenderer } from "./table-renderer";
 import { FormRenderer } from "./form-renderer";
@@ -25,6 +26,8 @@ export function RendererSwitch({ renderer, ...props }: RendererProps & { rendere
       return <PivotRenderer {...props} />;
     case "gantt":
       return <GanttRenderer {...props} />;
+    case "calendar":
+      return <CalendarRenderer {...props} />;
     case "table":
       return <DataTableRenderer {...props} />;
     default:

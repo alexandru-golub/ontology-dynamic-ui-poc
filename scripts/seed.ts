@@ -29,6 +29,7 @@ CREATE (pivotSurface:Surface {id: 'pivot', title: 'Project Pivot', name: 'Projec
 CREATE (scheduleSurface:Surface {id: 'schedule', title: 'Project Schedule', name: 'Projects Schedule', renderer: 'gantt', rootLabel: 'Project'})
 CREATE (intakeSurface:Surface {id: 'intake', title: 'Project Intake', name: 'Projects Intake', renderer: 'form', rootLabel: 'Project'})
 CREATE (analyticsSurface:Surface {id: 'analytics', title: 'Customer Analytics', name: 'Customers Analytics', renderer: 'table', rootLabel: 'Customer'})
+CREATE (calendarSurface:Surface {id: 'calendar', title: 'Project Calendar', name: 'Projects Calendar', renderer: 'calendar', rootLabel: 'Project'})
 
 // Projects surface — rows are Projects; columns come from Project, Customer and Status nodes
 CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: '<HAS_PROJECT:Customer.name', suggest: true, type: 'string'})
@@ -127,6 +128,14 @@ CREATE (analyticsSurface)-[:HAS_COLUMN]->(a4)
 CREATE (analyticsSurface)-[:HAS_COLUMN]->(a5)
 CREATE (analyticsSurface)-[:HAS_COLUMN]->(a6)
 
+// Project Calendar — calendar renderer config is positional: name, start, due.
+CREATE (k1:Column {id: 'colk_project', field: 'project', label: 'Project Title', order: 1, source: 'self.name', type: 'string'})
+CREATE (k2:Column {id: 'colk_start', field: 'start', label: 'Start', order: 2, source: 'self.start', type: 'date'})
+CREATE (k3:Column {id: 'colk_due', field: 'due', label: 'Due', order: 3, source: 'self.due', type: 'date'})
+CREATE (calendarSurface)-[:HAS_COLUMN]->(k1)
+CREATE (calendarSurface)-[:HAS_COLUMN]->(k2)
+CREATE (calendarSurface)-[:HAS_COLUMN]->(k3)
+
 // ---- Business data -------------------------------------------------------
 CREATE (acme:Customer {id: 'customer_acme', name: 'Acme Corp'})
 CREATE (globex:Customer {id: 'customer_globex', name: 'Globex'})
@@ -181,6 +190,10 @@ CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete:
 // Customer Analytics — read-only + export for everyone (aggregate columns are derived).
 CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
 CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
+
+// Project Calendar — read-only + export for everyone.
+CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
 `;
 
 async function seed() {
@@ -189,7 +202,7 @@ async function seed() {
     for (const constraint of constraints) await session.run(constraint);
     await session.run(clearQuery);
     await session.run(query);
-    console.log("Seeded admin, 2 demo users, 8 multi-source surfaces (form intake + aggregate analytics), validation rules and permissions.");
+    console.log("Seeded admin, 2 demo users, 9 multi-source surfaces (form intake + aggregate analytics + calendar), validation rules and permissions.");
   } finally {
     await session.close();
     await driver.close();

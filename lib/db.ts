@@ -57,7 +57,7 @@ export function sanitizeLabel(label: string): string {
 }
 
 /** Renderers implemented in the frontend; `Surface.renderer` must be one of these. */
-export const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt"] as const;
+export const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt", "calendar"] as const;
 
 export function sanitizeColumnType(type: string | null | undefined, fallback: ColumnType = "string"): ColumnType {
   const value = (type ?? fallback).toLowerCase();

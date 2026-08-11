@@ -94,6 +94,9 @@ Seeded surfaces:
 - **Customer Analytics** — `table` renderer: **aggregate sources** — for every
   customer: project count, total / average / largest / smallest project budget
   computed from `>HAS_PROJECT:Project.budget.sum|avg|min|max`.
+- **Project Calendar** — `calendar` renderer: month grid of projects
+  (name, start, due) with multi-day bars across cells and prev/next/today
+  navigation.
 
 Adding a column with a new source is a graph write — no frontend code needed.
 
@@ -130,6 +133,7 @@ shares one source of options. New values are still allowed.
 | `timeline` | vertical feed of records |
 | `pivot` | aggregate grid (row dim, col dim, value) with totals |
 | `gantt` | date bars across a shared timeline (name, start, due) |
+| `calendar` | month grid of events (title, start, due) with prev/next navigation; multi-day events span cells as bars |
 
 Switch renderers from the **Manage surface** dialog or the admin surface
 creator; unknown renderer values fall back to the table with a notice. Pivot and
@@ -262,8 +266,11 @@ Status legend: ✅ implemented · 🔜 next · 💭 later.
   rules (required / min / max / minLength / maxLength / pattern / options),
   enforced server-side on every write and shown inline in the form, create
   dialog and table editor.
-- 💭 **More renderers** — calendar, nested-detail tables; each new renderer is
-  one more entry in the registry.
+- ✅ **Calendar renderer** — month grid (title, start, due), prev/next/today
+  navigation, multi-day events as spanning bars, "+N more" overflow per day,
+  missing-date list — another entry in the renderer registry.
+- 💭 **More renderers** — nested-detail tables; each new renderer is one more
+  entry in the registry.
 
 ### Data & sources
 - ✅ **Typed relationship writes** — `>Rel:Label.prop` / `<Rel:Label.prop`
