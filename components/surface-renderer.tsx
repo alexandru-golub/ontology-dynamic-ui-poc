@@ -1,13 +1,14 @@
 "use client";
 
 import { gql, useApolloClient, useMutation, useQuery } from "@apollo/client";
-import { ChevronDown, ChevronUp, Download, Filter, GripVertical, Plus, Search, Settings2, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Download, Filter, GripVertical, Pencil, Plus, Search, Settings2, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { TableColumn, TableRowData } from "@/components/data-table";
 import { RendererSwitch } from "@/components/renderers/renderer-switch";
 import { SuggestInput } from "@/components/suggest-input";
 import { TypedInput } from "@/components/typed-input";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { validateField, validateValues } from "@/lib/validate";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -47,6 +48,14 @@ const GET_SURFACE = gql`
         suggest
         suggestSource
         type
+        required
+        min
+        max
+        minLength
+        maxLength
+        pattern
+        options
+        validationMessage
       }
       permissions {
         view
@@ -303,12 +312,17 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createErrors, setCreateErrors] = useState<Record<string, string>>({});
   const [manageOpen, setManageOpen] = useState(false);
   const [createValues, setCreateValues] = useState<Record<string, string>>({});
   const [titleDraft, setTitleDraft] = useState("");
   const [rootDraft, setRootDraft] = useState("");
   const [rendererDraft, setRendererDraft] = useState("table");
-  const [columnDraft, setColumnDraft] = useState({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "", type: "string" });
+  const [columnDraft, setColumnDraft] = useState({
+    field: "", label: "", source: "", order: "", suggest: false, suggestSource: "", type: "string",
+    required: false, min: "", max: "", minLength: "", maxLength: "", pattern: "", options: "", validationMessage: "",
+  });
+  const [editingColumnId, setEditingColumnId] = useState<string | null>(null);
   // column reorder state (manage dialog)
   const [columnsDraft, setColumnsDraft] = useState<TableColumn[] | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
@@ -343,15 +357,35 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
     const initial: Record<string, string> = {};
     for (const column of surface.columns) initial[column.field] = "";
     setCreateValues(initial);
+    setCreateErrors({});
     setCreateOpen(true);
+  };
+
+  const changeCreateValue = (field: string, value: string) => {
+    setCreateValues((prev) => ({ ...prev, [field]: value }));
+    setCreateErrors((prev) => {
+      if (!(field in prev)) return prev;
+      const next = { ...prev };
+      const column = surface.columns.find((c) => c.field === field);
+      const error = validateField(column, value);
+      if (error) next[field] = error;
+      else delete next[field];
+      return next;
+    });
   };
 
   const submitCreate = async () => {
     const values: Record<string, unknown> = {};
     for (const column of surface.columns) values[column.field] = createValues[column.field] ?? "";
+    const found = validateValues(surface.columns, values);
+    if (Object.keys(found).length > 0) {
+      setCreateErrors(found);
+      return;
+    }
     try {
       await createRow({ variables: { surfaceId, values } });
       setCreateOpen(false);
+      setCreateErrors({});
       setNotice("Row created.");
       await Promise.all([refetch(), loadPage(null)]);
     } catch (err) {
@@ -403,31 +437,85 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
     }
   };
 
-  const submitAddColumn = async () => {
+  /** Convert the validation-rule fields of the column draft into a GraphQL input. */
+  const rulesFromDraft = (draft: typeof columnDraft) => {
+    const num = (value: string) => (value.trim() === "" ? undefined : Number(value));
+    return {
+      required: draft.required,
+      min: num(draft.min),
+      max: num(draft.max),
+      minLength: num(draft.minLength),
+      maxLength: num(draft.maxLength),
+      pattern: draft.pattern.trim() || undefined,
+      options: draft.options
+        .split(",")
+        .map((o) => o.trim())
+        .filter(Boolean) || undefined,
+      validationMessage: draft.validationMessage.trim() || undefined,
+    };
+  };
+
+  const resetColumnDraft = () =>
+    setColumnDraft({
+      field: "", label: "", source: "", order: "", suggest: false, suggestSource: "", type: "string",
+      required: false, min: "", max: "", minLength: "", maxLength: "", pattern: "", options: "", validationMessage: "",
+    });
+
+  /** Load an existing column into the add/edit form. */
+  const editColumn = (column: TableColumn) => {
+    setEditingColumnId(column.id ?? null);
+    setColumnDraft({
+      field: column.field,
+      label: column.label,
+      source: column.source ?? "",
+      order: String(column.order),
+      suggest: Boolean(column.suggest),
+      suggestSource: column.suggestSource ?? "",
+      type: column.type ?? "string",
+      required: Boolean(column.required),
+      min: column.min === null || column.min === undefined ? "" : String(column.min),
+      max: column.max === null || column.max === undefined ? "" : String(column.max),
+      minLength: column.minLength === null || column.minLength === undefined ? "" : String(column.minLength),
+      maxLength: column.maxLength === null || column.maxLength === undefined ? "" : String(column.maxLength),
+      pattern: column.pattern ?? "",
+      options: column.options?.join(", ") ?? "",
+      validationMessage: column.validationMessage ?? "",
+    });
+  };
+
+  const cancelEditColumn = () => {
+    setEditingColumnId(null);
+    resetColumnDraft();
+  };
+
+  const submitColumn = async () => {
     if (!columnDraft.field.trim() || !columnDraft.label.trim()) {
-      setNotice("Field and label are required for a new column.");
+      setNotice("Field and label are required for a column.");
       return;
     }
+    const input = {
+      field: columnDraft.field.trim(),
+      label: columnDraft.label.trim(),
+      source: columnDraft.source.trim() || undefined,
+      order: columnDraft.order ? Number(columnDraft.order) : null,
+      suggest: columnDraft.suggest,
+      suggestSource: columnDraft.suggestSource.trim() || undefined,
+      type: columnDraft.type,
+      ...rulesFromDraft(columnDraft),
+    };
     try {
-      await addColumn({
-        variables: {
-          surfaceId,
-          input: {
-            field: columnDraft.field.trim(),
-            label: columnDraft.label.trim(),
-            source: columnDraft.source.trim() || undefined,
-            order: columnDraft.order ? Number(columnDraft.order) : null,
-            suggest: columnDraft.suggest,
-            suggestSource: columnDraft.suggestSource.trim() || undefined,
-            type: columnDraft.type,
-          },
-        },
-      });
-      setColumnDraft({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "", type: "string" });
-      setNotice(`Column "${columnDraft.field}" added.`);
+      if (editingColumnId) {
+        await updateColumn({ variables: { surfaceId, columnId: editingColumnId, input } });
+        setNotice(`Column "${input.label}" saved.`);
+        cancelEditColumn();
+      } else {
+        await addColumn({ variables: { surfaceId, input } });
+        setNotice(`Column "${input.field}" added.`);
+        resetColumnDraft();
+      }
       await refetch();
     } catch (err) {
-      setNotice(`Add column failed: ${err instanceof Error ? err.message : String(err)}`);
+      setNotice(`${editingColumnId ? "Save" : "Add"} column failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -607,18 +695,22 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                 <div key={column.field} className="grid gap-1.5">
                   <Label htmlFor={`create-${column.field}`}>
                     {column.label}
+                    {column.required && <span className="ml-1 text-destructive">*</span>}
                     <span className="ml-2 font-mono text-[10px] text-muted-foreground">
                       {column.source ?? column.field}
                       {column.suggest ? " · suggest" : ""}
+                      {column.options?.length ? ` · ${column.options.join("/")}` : ""}
                     </span>
                   </Label>
                   <TypedInput
                     id={`create-${column.field}`}
                     type={column.type}
                     value={createValues[column.field] ?? ""}
-                    onChange={(v) => setCreateValues((prev) => ({ ...prev, [column.field]: v }))}
+                    onChange={(v) => changeCreateValue(column.field, v)}
                     onCommit={() => undefined}
                     suggestions={suggestions[column.field]}
+                    options={column.options}
+                    error={createErrors[column.field] ?? null}
                   />
                 </div>
               ))}
@@ -728,7 +820,9 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
               Definitions live in Neo4j — the UI re-renders from these. Sources:{" "}
               <code className="text-xs">self.prop</code>, <code className="text-xs">Label.prop</code>,{" "}
               <code className="text-xs">&gt;Rel:Label.prop</code>, <code className="text-xs">&lt;Rel:Label.prop</code>,{" "}
-              <code className="text-xs">Label.count</code>.
+              <code className="text-xs">Label.count</code>, plus aggregates{" "}
+              <code className="text-xs">Label.prop.sum|avg|min|max</code> and{" "}
+              <code className="text-xs">&gt;Rel:Label.prop.sum|avg|min|max</code>.
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-4">
@@ -785,6 +879,14 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                         {column.suggest && (
                           <span className="ml-1 rounded bg-primary/15 px-1 py-0.5 text-[10px] font-semibold text-primary">suggest</span>
                         )}
+                        {Boolean(column.required) && (
+                          <span className="ml-1 rounded bg-destructive/10 px-1 py-0.5 text-[10px] font-semibold text-destructive">required</span>
+                        )}
+                        {column.options?.length ? (
+                          <span className="ml-1 rounded bg-muted px-1 py-0.5 text-[10px] font-semibold text-muted-foreground">
+                            {column.options.length} options
+                          </span>
+                        ) : null}
                       </span>
                     </span>
                     <span className="flex shrink-0 items-center gap-1">
@@ -803,6 +905,14 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                         aria-label={`Move ${column.label} down`}
                       >
                         <ChevronDown className="h-4 w-4" />
+                      </button>
+                      <button
+                        className="rounded p-0.5 text-muted-foreground hover:text-foreground"
+                        onClick={() => editColumn(column)}
+                        aria-label={`Edit column ${column.label}`}
+                        title="Edit column (label, source, type, validation)"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <label className="ml-1 flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground">
                         <input
@@ -830,9 +940,21 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
             </div>
 
             <div className="grid gap-1.5">
-              <Label className="mb-1 block">Add column</Label>
+              <div className="mb-1 flex items-center justify-between">
+                <Label className="block">{editingColumnId ? "Edit column" : "Add column"}</Label>
+                {editingColumnId && (
+                  <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={cancelEditColumn}>
+                    <X className="h-3.5 w-3.5" /> Cancel edit
+                  </Button>
+                )}
+              </div>
               <div className="grid grid-cols-[1fr_1fr_1.2fr_0.8fr_64px_110px] gap-2">
-                <Input placeholder="field" value={columnDraft.field} onChange={(e) => setColumnDraft((p) => ({ ...p, field: e.target.value }))} />
+                <Input
+                  placeholder="field"
+                  value={columnDraft.field}
+                  disabled={Boolean(editingColumnId)}
+                  onChange={(e) => setColumnDraft((p) => ({ ...p, field: e.target.value }))}
+                />
                 <Input placeholder="label" value={columnDraft.label} onChange={(e) => setColumnDraft((p) => ({ ...p, label: e.target.value }))} />
                 <Input
                   placeholder="source (e.g. >HAS_STATUS:Status.name)"
@@ -863,9 +985,36 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                 />
                 Recommend existing values while typing (per-field, on/off)
               </label>
+
+              {/* ---- validation rules (enforced server-side on every write) ---- */}
+              <div className="rounded-md border p-2">
+                <div className="mb-2 flex items-center justify-between">
+                  <Label className="text-xs">Validation rules</Label>
+                  <span className="font-mono text-[10px] text-muted-foreground">required · min · max · lengths · pattern · options</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <label className="flex items-center gap-1.5 rounded border px-2 py-1.5 text-xs hover:bg-muted">
+                    <input
+                      type="checkbox"
+                      checked={columnDraft.required}
+                      onChange={(e) => setColumnDraft((p) => ({ ...p, required: e.target.checked }))}
+                      className="h-3.5 w-3.5 accent-[var(--primary)]"
+                    />
+                    required
+                  </label>
+                  <Input placeholder="min" type="number" value={columnDraft.min} onChange={(e) => setColumnDraft((p) => ({ ...p, min: e.target.value }))} className="h-8 text-xs" />
+                  <Input placeholder="max" type="number" value={columnDraft.max} onChange={(e) => setColumnDraft((p) => ({ ...p, max: e.target.value }))} className="h-8 text-xs" />
+                  <Input placeholder="min length" type="number" value={columnDraft.minLength} onChange={(e) => setColumnDraft((p) => ({ ...p, minLength: e.target.value }))} className="h-8 text-xs" />
+                  <Input placeholder="max length" type="number" value={columnDraft.maxLength} onChange={(e) => setColumnDraft((p) => ({ ...p, maxLength: e.target.value }))} className="h-8 text-xs" />
+                  <Input placeholder="regex pattern" value={columnDraft.pattern} onChange={(e) => setColumnDraft((p) => ({ ...p, pattern: e.target.value }))} className="h-8 text-xs" />
+                  <Input placeholder="options (comma-separated)" value={columnDraft.options} onChange={(e) => setColumnDraft((p) => ({ ...p, options: e.target.value }))} className="h-8 text-xs" />
+                  <Input placeholder="custom error message" value={columnDraft.validationMessage} onChange={(e) => setColumnDraft((p) => ({ ...p, validationMessage: e.target.value }))} className="h-8 text-xs" />
+                </div>
+              </div>
+
               <div className="mt-1 flex justify-end">
-                <Button size="sm" variant="secondary" onClick={() => void submitAddColumn()}>
-                  <Plus /> Add column
+                <Button size="sm" variant="secondary" onClick={() => void submitColumn()}>
+                  <Plus /> {editingColumnId ? "Save column" : "Add column"}
                 </Button>
               </div>
             </div>

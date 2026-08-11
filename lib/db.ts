@@ -18,6 +18,15 @@ export type Column = {
   suggest: boolean;
   suggestSource: string | null;
   type: ColumnType;
+  // ---- per-field validation rules (graph data, enforced on every write) ----
+  required: boolean;
+  min: number | null;
+  max: number | null;
+  minLength: number | null;
+  maxLength: number | null;
+  pattern: string | null;
+  options: string[] | null;
+  validationMessage: string | null;
 };
 export type SurfaceMeta = { id: string; title: string; renderer: string; rootLabel: string; columns: Column[] };
 export type SurfaceRow = { id: string; values: Record<string, unknown> };
@@ -90,6 +99,173 @@ export function coerceValue(type: ColumnType, value: unknown): unknown {
   return value;
 }
 
+// ---------------------------------------------------------------------------
+// Per-field validation rules
+// ---------------------------------------------------------------------------
+export type ValidationRules = Pick<
+  Column,
+  "required" | "min" | "max" | "minLength" | "maxLength" | "pattern" | "options" | "validationMessage"
+>;
+
+/**
+ * Sanitize user-supplied validation rules before they hit the graph.
+ * Unknown keys are ignored, wrong shapes throw a friendly BAD_INPUT error.
+ */
+export function sanitizeValidationRules(input: Record<string, unknown> | null | undefined): ValidationRules {
+  if (!input) return emptyValidationRules();
+  const rules: ValidationRules = emptyValidationRules();
+
+  if (input.required !== undefined && input.required !== null) {
+    if (typeof input.required !== "boolean") {
+      throw new GraphQLError("Validation rule `required` must be a boolean", { extensions: { code: "BAD_INPUT" } });
+    }
+    rules.required = input.required;
+  }
+  for (const key of ["min", "max"] as const) {
+    const value = input[key];
+    if (value === undefined || value === null) continue;
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+      throw new GraphQLError(`Validation rule \`${key}\` must be a number`, { extensions: { code: "BAD_INPUT" } });
+    }
+    rules[key] = num;
+  }
+  for (const key of ["minLength", "maxLength"] as const) {
+    const value = input[key];
+    if (value === undefined || value === null) continue;
+    const num = Number(value);
+    if (!Number.isInteger(num) || num < 0) {
+      throw new GraphQLError(`Validation rule \`${key}\` must be a non-negative integer`, { extensions: { code: "BAD_INPUT" } });
+    }
+    rules[key] = num;
+  }
+  if (input.pattern !== undefined && input.pattern !== null) {
+    if (typeof input.pattern !== "string") {
+      throw new GraphQLError("Validation rule `pattern` must be a string", { extensions: { code: "BAD_INPUT" } });
+    }
+    try {
+      new RegExp(input.pattern);
+    } catch {
+      throw new GraphQLError(`Validation rule \`pattern\` is not a valid regular expression: "${input.pattern}"`, {
+        extensions: { code: "BAD_INPUT" },
+      });
+    }
+    rules.pattern = input.pattern;
+  }
+  if (input.options !== undefined && input.options !== null) {
+    if (!Array.isArray(input.options) || input.options.some((o) => typeof o !== "string" || !o.trim())) {
+      throw new GraphQLError("Validation rule `options` must be a list of non-empty strings", {
+        extensions: { code: "BAD_INPUT" },
+      });
+    }
+    if (input.options.length > 200) {
+      throw new GraphQLError("Validation rule `options` supports at most 200 values", { extensions: { code: "BAD_INPUT" } });
+    }
+    rules.options = [...new Set(input.options.map((o: string) => o.trim()))];
+  }
+  if (input.validationMessage !== undefined && input.validationMessage !== null) {
+    if (typeof input.validationMessage !== "string") {
+      throw new GraphQLError("Validation rule `validationMessage` must be a string", { extensions: { code: "BAD_INPUT" } });
+    }
+    rules.validationMessage = input.validationMessage.trim() || null;
+  }
+  if (rules.min !== null && rules.max !== null && rules.min > rules.max) {
+    throw new GraphQLError("Validation rule `min` cannot be greater than `max`", { extensions: { code: "BAD_INPUT" } });
+  }
+  if (rules.minLength !== null && rules.maxLength !== null && rules.minLength > rules.maxLength) {
+    throw new GraphQLError("Validation rule `minLength` cannot be greater than `maxLength`", {
+      extensions: { code: "BAD_INPUT" },
+    });
+  }
+  return rules;
+}
+
+export function emptyValidationRules(): ValidationRules {
+  return {
+    required: false,
+    min: null,
+    max: null,
+    minLength: null,
+    maxLength: null,
+    pattern: null,
+    options: null,
+    validationMessage: null,
+  };
+}
+
+/** Pull the rule fields off a Column (used to persist only the rule subset). */
+export function validationRulesOf(column: Column): ValidationRules {
+  return {
+    required: column.required,
+    min: column.min,
+    max: column.max,
+    minLength: column.minLength,
+    maxLength: column.maxLength,
+    pattern: column.pattern,
+    options: column.options,
+    validationMessage: column.validationMessage,
+  };
+}
+
+function blank(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  const text = typeof value === "string" ? value.trim() : String(value);
+  return text === "";
+}
+
+/**
+ * Validate one raw write value against a column's rules. Returns a friendly
+ * message (or the column's custom `validationMessage`) or null when valid.
+ * Pure function — mirrors client-side `lib/validate.ts`.
+ */
+export function validateValue(column: Pick<Column, "label" | "field" | "type" | keyof ValidationRules>, raw: unknown): string | null {
+  const label = column.label || column.field;
+  const fail = (message: string) => column.validationMessage || message;
+  if (blank(raw)) {
+    return column.required ? fail(`${label} is required`) : null;
+  }
+  const text = typeof raw === "string" ? raw.trim() : String(raw);
+  if (column.options?.length && !column.options.includes(text)) {
+    return fail(`${label} must be one of: ${column.options.join(", ")}`);
+  }
+  if (column.type === "number" || column.type === "money") {
+    const num = Number(text.replace(/[$,\s]/g, ""));
+    if (!Number.isNaN(num)) {
+      if (column.min !== null && num < column.min) return fail(`${label} must be at least ${column.min}`);
+      if (column.max !== null && num > column.max) return fail(`${label} must be at most ${column.max}`);
+    }
+  }
+  if (column.minLength !== null && text.length < column.minLength) {
+    return fail(`${label} must be at least ${column.minLength} characters`);
+  }
+  if (column.maxLength !== null && text.length > column.maxLength) {
+    return fail(`${label} must be at most ${column.maxLength} characters`);
+  }
+  if (column.pattern) {
+    try {
+      if (!new RegExp(column.pattern).test(text)) return fail(`${label} must match ${column.pattern}`);
+    } catch {
+      // invalid regex stored in the graph — ignore rather than break writes
+    }
+  }
+  return null;
+}
+
+/** Validate a values map against the surface's columns (used on every write). */
+export function validateColumnValues(columns: Column[], values: Record<string, unknown>): void {
+  const errors: Array<{ field: string; message: string }> = [];
+  for (const column of columns) {
+    if (!(column.field in values)) continue;
+    const error = validateValue(column, values[column.field]);
+    if (error) errors.push({ field: column.field, message: error });
+  }
+  if (errors.length > 0) {
+    throw new GraphQLError(errors.map((e) => e.message).join("; "), {
+      extensions: { code: "BAD_INPUT", fields: errors.map((e) => e.field) },
+    });
+  }
+}
+
 export function validateRenderer(renderer: string | null | undefined): void {
   if (renderer && !(RENDERERS as readonly string[]).includes(renderer)) {
     throw new GraphQLError(
@@ -102,7 +278,8 @@ export function validateRenderer(renderer: string | null | undefined): void {
 export type ColumnSource =
   | { kind: "self"; prop: string }
   | { kind: "neighbor"; label: string; prop: string; rel: string | null; dir: "in" | "out" | null }
-  | { kind: "count"; label: string; rel: string | null; dir: "in" | "out" | null };
+  | { kind: "count"; label: string; rel: string | null; dir: "in" | "out" | null }
+  | { kind: "aggregate"; agg: "sum" | "avg" | "min" | "max"; label: string; prop: string; rel: string | null; dir: "in" | "out" | null };
 
 const LABEL_RE = "[A-Za-z_][A-Za-z0-9_]*";
 
@@ -125,6 +302,17 @@ export function parseSource(source: string | null | undefined, field: string): C
   if (typedCount) {
     return { kind: "count", label: typedCount[3], rel: typedCount[2], dir: typedCount[1] === ">" ? "out" : "in" };
   }
+  const typedAgg = src.match(new RegExp(`^([<>])(${LABEL_RE}):(${LABEL_RE})\.(${LABEL_RE})\.(sum|avg|min|max)$`));
+  if (typedAgg) {
+    return {
+      kind: "aggregate",
+      agg: typedAgg[5] as "sum" | "avg" | "min" | "max",
+      label: typedAgg[3],
+      prop: typedAgg[4],
+      rel: typedAgg[2],
+      dir: typedAgg[1] === ">" ? "out" : "in",
+    };
+  }
   const typed = src.match(new RegExp(`^([<>])(${LABEL_RE}):(${LABEL_RE})\.(${LABEL_RE})$`));
   if (typed) {
     return { kind: "neighbor", label: typed[3], prop: typed[4], rel: typed[2], dir: typed[1] === ">" ? "out" : "in" };
@@ -132,6 +320,18 @@ export function parseSource(source: string | null | undefined, field: string): C
   // legacy Label.count
   const countMatch = src.match(new RegExp(`^(${LABEL_RE})\.count$`));
   if (countMatch) return { kind: "count", label: countMatch[1], rel: null, dir: null };
+  // legacy Label.prop.agg (any relationship)
+  const legacyAgg = src.match(new RegExp(`^(${LABEL_RE})\.(${LABEL_RE})\.(sum|avg|min|max)$`));
+  if (legacyAgg) {
+    return {
+      kind: "aggregate",
+      agg: legacyAgg[3] as "sum" | "avg" | "min" | "max",
+      label: legacyAgg[1],
+      prop: legacyAgg[2],
+      rel: null,
+      dir: null,
+    };
+  }
   // legacy Label.prop
   const match = src.match(new RegExp(`^(${LABEL_RE})\.(${LABEL_RE})$`));
   if (match) return { kind: "neighbor", label: match[1], prop: match[2], rel: null, dir: null };
@@ -146,13 +346,15 @@ export function parseSource(source: string | null | undefined, field: string): C
 export function validateSource(source: string | null | undefined, field: string): void {
   const src = (source ?? "").trim();
   if (!src) return; // legacy inference by field name applies
+  const propOrCount = `(${LABEL_RE}|count)`;
+  const agg = `(${LABEL_RE})\.(sum|avg|min|max)`;
   const known =
     src.startsWith("self.") ||
-    new RegExp(`^[<>]${LABEL_RE}:${LABEL_RE}\.(${LABEL_RE}|count)$`).test(src) ||
-    new RegExp(`^${LABEL_RE}\.(${LABEL_RE}|count)$`).test(src);
+    new RegExp(`^[<>]${LABEL_RE}:${LABEL_RE}\.(${LABEL_RE}|count|${LABEL_RE}\.(sum|avg|min|max))$`).test(src) ||
+    new RegExp(`^${LABEL_RE}\.(${LABEL_RE}|count|${LABEL_RE}\.(sum|avg|min|max))$`).test(src);
   if (!known) {
     throw new GraphQLError(
-      `Invalid column source "${src}" for field "${field}". Use self.prop, Label.prop, Label.count, >Rel:Label.prop, <Rel:Label.prop, >Rel:Label.count or <Rel:Label.count.`,
+      `Invalid column source "${src}" for field "${field}". Use self.prop, Label.prop, Label.count, Label.prop.sum|avg|min|max, >Rel:Label.prop, <Rel:Label.prop, >Rel:Label.count, >Rel:Label.prop.sum|avg|min|max or <Rel:Label.prop.sum|avg|min|max.`,
       { extensions: { code: "BAD_INPUT" } },
     );
   }
@@ -169,7 +371,24 @@ RETURN s.id AS id,
        coalesce(s.title, s.name) AS title,
        s.renderer AS renderer,
        coalesce(s.rootLabel, 'Project') AS rootLabel,
-       [c IN collect(column) WHERE c IS NOT NULL | { id: elementId(c), field: c.field, label: c.label, order: toInteger(c.order), source: c.source, suggest: coalesce(c.suggest, false), suggestSource: c.suggestSource, type: coalesce(c.type, 'string') }] AS columns`;
+       [c IN collect(column) WHERE c IS NOT NULL | {
+         id: elementId(c),
+         field: c.field,
+         label: c.label,
+         order: toInteger(c.order),
+         source: c.source,
+         suggest: coalesce(c.suggest, false),
+         suggestSource: c.suggestSource,
+         type: coalesce(c.type, 'string'),
+         required: coalesce(c.required, false),
+         min: c.min,
+         max: c.max,
+         minLength: c.minLength,
+         maxLength: c.maxLength,
+         pattern: c.pattern,
+         options: c.options,
+         validationMessage: c.validationMessage
+       }] AS columns`;
 
 export async function getSurfaceMeta(surfaceId: string): Promise<SurfaceMeta> {
   const session = driver.session({ defaultAccessMode: "READ" });
@@ -185,7 +404,19 @@ export async function getSurfaceMeta(surfaceId: string): Promise<SurfaceMeta> {
     };
     return {
       ...record,
-      columns: record.columns.map((c) => ({ ...c, order: Number(c.order), type: sanitizeColumnType(c.type) })),
+      columns: record.columns.map((c) => ({
+        ...c,
+        order: Number(c.order),
+        type: sanitizeColumnType(c.type),
+        required: Boolean(c.required),
+        min: c.min === null || c.min === undefined ? null : Number(c.min),
+        max: c.max === null || c.max === undefined ? null : Number(c.max),
+        minLength: c.minLength === null || c.minLength === undefined ? null : Number(c.minLength),
+        maxLength: c.maxLength === null || c.maxLength === undefined ? null : Number(c.maxLength),
+        pattern: c.pattern ?? null,
+        options: Array.isArray(c.options) ? c.options.map(String) : null,
+        validationMessage: c.validationMessage ?? null,
+      })),
     };
   } finally {
     await session.close();
@@ -263,7 +494,14 @@ function buildFilterCondition(filter: ColumnFilter, alias: string, params: Recor
  */
 function buildProjectionQuery(rootLabel: string, columns: Column[], opts: ProjectionOpts = {}) {
   const label = sanitizeLabel(rootLabel);
-  const clauses: string[] = [];
+  // OPTIONAL MATCHes for neighbor/count columns run in the main query scope;
+  // aggregates run in isolated CALL { } subqueries. Multiple OPTIONAL MATCHes
+  // in one scope multiply result rows (cartesian product), which corrupts
+  // sum() (avg/min/max and count(DISTINCT) happen to be duplication-invariant);
+  // a subquery per aggregate column keeps every value exact.
+  const matchClauses: string[] = [];
+  const callClauses: string[] = [];
+  const callAliases: string[] = [];
   const returns: string[] = [];
   const aliases: Record<string, string> = {};
   const params: Record<string, unknown> = {};
@@ -279,7 +517,7 @@ function buildProjectionQuery(rootLabel: string, columns: Column[], opts: Projec
           : source.rel && source.dir === "out"
             ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
             : `(root)--(n${index}:${source.label})`;
-      clauses.push(`OPTIONAL MATCH ${pattern}`);
+      matchClauses.push(`OPTIONAL MATCH ${pattern}`);
       returns.push(`collect(DISTINCT n${index}.${source.prop})[0] AS ${alias}`);
     } else if (source.kind === "count") {
       const pattern =
@@ -288,8 +526,22 @@ function buildProjectionQuery(rootLabel: string, columns: Column[], opts: Projec
           : source.rel && source.dir === "out"
             ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
             : `(root)--(n${index}:${source.label})`;
-      clauses.push(`OPTIONAL MATCH ${pattern}`);
+      matchClauses.push(`OPTIONAL MATCH ${pattern}`);
       returns.push(`count(DISTINCT n${index}) AS ${alias}`);
+    } else if (source.kind === "aggregate") {
+      // Numeric aggregation over a typed (or any) relationship. toFloat keeps
+      // string-stored numbers working; non-numeric values are ignored, and
+      // empty sets yield 0 for sum (null for avg/min/max) — matching SQL.
+      const pattern =
+        source.rel && source.dir === "in"
+          ? `(root)<-[n${index}_r:${source.rel}]-(n${index}:${source.label})`
+          : source.rel && source.dir === "out"
+            ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
+            : `(root)--(n${index}:${source.label})`;
+      callClauses.push(
+        `CALL { WITH root\nOPTIONAL MATCH ${pattern}\nRETURN ${source.agg}(toFloat(n${index}.${source.prop})) AS ${alias} }`,
+      );
+      callAliases.push(alias);
     }
     aliases[column.field] = alias;
   });
@@ -316,11 +568,18 @@ function buildProjectionQuery(rootLabel: string, columns: Column[], opts: Projec
   }
   const where = whereParts.length ? `WHERE ${whereParts.join("\nAND ")}` : "";
   const projected = returns.length ? ", " + returns.join(", ") : "";
-  // The WITH introduces id/rootProps/vN aliases; the RETURN may only reference
-  // those aliases (aggregates like collect() are no longer in scope after the
-  // WITH, and re-evaluating them would also re-run the OPTIONAL MATCHes).
   const returnAliases = columns.length ? ", " + columns.map((_, index) => `v${index}`).join(", ") : "";
-  const core = `MATCH (root:\`${label}\`)\n${clauses.join("\n")}\nWITH root, elementId(root) AS id, properties(root) AS rootProps${projected}\n${where}`;
+  // 1) MATCH roots; 2) aggregate CALLs (one row per root); 3) carry root +
+  //    aggregate aliases; 4) neighbor/count OPTIONAL MATCHes; 5) project all
+  //    aliases (collect/count collapse the multiplied rows back to one/root);
+  //    the RETURN may only reference aliases bound in that final WITH.
+  const core =
+    `MATCH (root:\`${label}\`)\n` +
+    (callClauses.length ? callClauses.join("\n") + "\n" : "") +
+    `WITH root${callAliases.length ? ", " + callAliases.join(", ") : ""}\n` +
+    (matchClauses.length ? matchClauses.join("\n") + "\n" : "") +
+    `WITH root, elementId(root) AS id, properties(root) AS rootProps${projected}${callAliases.length ? ", " + callAliases.join(", ") : ""}\n` +
+    where;
   const query = `${core}\nRETURN id, rootProps${returnAliases}`;
   return { query, core, aliases, params };
 }
@@ -333,7 +592,14 @@ function assembleRows(records: unknown[], columns: Column[], aliases: Record<str
     for (const column of columns) {
       const source = parseSource(column.source, column.field);
       if (source.kind === "self") values[column.field] = toPlain(rootProps[source.prop]) ?? null;
-      else values[column.field] = toPlain(obj[aliases[column.field]]) ?? null;
+      else {
+        let value = toPlain(obj[aliases[column.field]]);
+        // money aggregates can accumulate float error (0.1 + 0.2); round to cents
+        if (source.kind === "aggregate" && column.type === "money" && typeof value === "number") {
+          value = Math.round(value * 100) / 100;
+        }
+        values[column.field] = value ?? null;
+      }
     }
     return { id: String(obj.id), values };
   });
@@ -440,6 +706,7 @@ const LEGACY_LINKS: Record<string, { rel: string; dir: "in" | "out" }> = {
  * coerced to the column's declared type (number/boolean/date/money/string).
  */
 function routeValues(columns: Column[], values: Record<string, unknown>) {
+  validateColumnValues(columns, values);
   const props: Record<string, unknown> = {};
   const neighbors: Record<string, LinkSpec> = {};
   for (const column of columns) {
@@ -874,7 +1141,7 @@ export async function getSuggestions(surface: SurfaceMeta): Promise<Array<{ fiel
   for (const column of surface.columns) {
     if (!column.suggest) continue;
     const source = parseSource(column.source, column.field);
-    if (source.kind === "count") continue;
+    if (source.kind === "count" || source.kind === "aggregate") continue;
     const label = column.suggestSource ?? (source.kind === "neighbor" ? source.label : surface.rootLabel);
     groups.push({ field: column.field, label, prop: source.prop });
   }
@@ -1179,7 +1446,23 @@ export async function adminCreateSurface(input: {
   title: string;
   renderer?: string;
   rootLabel?: string;
-  columns?: Array<{ field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string }>;
+  columns?: Array<{
+    field: string;
+    label: string;
+    order?: number;
+    source?: string;
+    suggest?: boolean;
+    suggestSource?: string;
+    type?: string;
+    required?: boolean;
+    min?: number | null;
+    max?: number | null;
+    minLength?: number | null;
+    maxLength?: number | null;
+    pattern?: string | null;
+    options?: string[] | null;
+    validationMessage?: string | null;
+  }>;
 }) {
   sanitizeLabel(input.rootLabel ?? "Project");
   validateRenderer(input.renderer);
@@ -1188,6 +1471,8 @@ export async function adminCreateSurface(input: {
       throw new GraphQLError("Column field and label are required", { extensions: { code: "BAD_INPUT" } });
     }
     validateSource(column.source, column.field);
+    sanitizeColumnType(column.type);
+    sanitizeValidationRules(column);
   }
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
@@ -1203,9 +1488,27 @@ export async function adminCreateSurface(input: {
       throw err;
     }
     for (const [index, column] of (input.columns ?? []).entries()) {
+      const rules = sanitizeValidationRules(column);
       await session.run(
         `MATCH (s:Surface {id: $id})
-         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source, suggest: $suggest, suggestSource: $suggestSource})
+         CREATE (c:Column {
+           id: $columnId,
+           field: $field,
+           label: $label,
+           order: toInteger($order),
+           source: $source,
+           suggest: $suggest,
+           suggestSource: $suggestSource,
+           type: $type,
+           required: $required,
+           min: $min,
+           max: $max,
+           minLength: $minLength,
+           maxLength: $maxLength,
+           pattern: $pattern,
+           options: $options,
+           validationMessage: $validationMessage
+         })
          CREATE (s)-[:HAS_COLUMN]->(c)`,
         {
           id: input.id,
@@ -1216,6 +1519,15 @@ export async function adminCreateSurface(input: {
           source: column.source ?? null,
           suggest: column.suggest ?? false,
           suggestSource: column.suggestSource ?? null,
+          type: sanitizeColumnType(column.type),
+          required: rules.required,
+          min: rules.min,
+          max: rules.max,
+          minLength: rules.minLength,
+          maxLength: rules.maxLength,
+          pattern: rules.pattern,
+          options: rules.options,
+          validationMessage: rules.validationMessage,
         },
       );
     }

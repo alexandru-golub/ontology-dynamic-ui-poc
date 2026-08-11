@@ -27,13 +27,15 @@ CREATE (peopleSurface:Surface {id: 'people', title: 'People & Roles', name: 'Peo
 CREATE (boardSurface:Surface {id: 'board', title: 'Project Board', name: 'Projects Board', renderer: 'board', rootLabel: 'Project'})
 CREATE (pivotSurface:Surface {id: 'pivot', title: 'Project Pivot', name: 'Projects Pivot', renderer: 'pivot', rootLabel: 'Project'})
 CREATE (scheduleSurface:Surface {id: 'schedule', title: 'Project Schedule', name: 'Projects Schedule', renderer: 'gantt', rootLabel: 'Project'})
+CREATE (intakeSurface:Surface {id: 'intake', title: 'Project Intake', name: 'Projects Intake', renderer: 'form', rootLabel: 'Project'})
+CREATE (analyticsSurface:Surface {id: 'analytics', title: 'Customer Analytics', name: 'Customers Analytics', renderer: 'table', rootLabel: 'Customer'})
 
 // Projects surface — rows are Projects; columns come from Project, Customer and Status nodes
 CREATE (c1:Column {id: 'col_customer', field: 'customer', label: 'Customer Name', order: 1, source: '<HAS_PROJECT:Customer.name', suggest: true, type: 'string'})
-CREATE (c2:Column {id: 'col_project', field: 'project', label: 'Project Title', order: 2, source: 'self.name', type: 'string'})
+CREATE (c2:Column {id: 'col_project', field: 'project', label: 'Project Title', order: 2, source: 'self.name', type: 'string', required: true, maxLength: 120})
 CREATE (c3:Column {id: 'col_status', field: 'status', label: 'Status', order: 3, source: '>HAS_STATUS:Status.name', suggest: true, type: 'string'})
 CREATE (c4:Column {id: 'col_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner', suggest: true, type: 'string'})
-CREATE (c5:Column {id: 'col_budget', field: 'budget', label: 'Budget (USD)', order: 5, source: 'self.budget', type: 'money'})
+CREATE (c5:Column {id: 'col_budget', field: 'budget', label: 'Budget (USD)', order: 5, source: 'self.budget', type: 'money', min: 0})
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c1)
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c2)
 CREATE (projectsSurface)-[:HAS_COLUMN]->(c3)
@@ -81,23 +83,59 @@ CREATE (pivotSurface)-[:HAS_COLUMN]->(p3)
 
 // Project Schedule — gantt renderer config is positional: name, start, due.
 CREATE (g1:Column {id: 'colg_project', field: 'project', label: 'Project Title', order: 1, source: 'self.name', type: 'string'})
-CREATE (g2:Column {id: 'colg_start', field: 'start', label: 'Start', order: 2, source: 'self.start', type: 'date'})
-CREATE (g3:Column {id: 'colg_due', field: 'due', label: 'Due', order: 3, source: 'self.due', type: 'date'})
+CREATE (g2:Column {id: 'colg_start', field: 'start', label: 'Start', order: 2, source: 'self.start', type: 'date', required: true})
+CREATE (g3:Column {id: 'colg_due', field: 'due', label: 'Due', order: 3, source: 'self.due', type: 'date', required: true})
 CREATE (g4:Column {id: 'colg_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner', type: 'string'})
 CREATE (scheduleSurface)-[:HAS_COLUMN]->(g1)
 CREATE (scheduleSurface)-[:HAS_COLUMN]->(g2)
 CREATE (scheduleSurface)-[:HAS_COLUMN]->(g3)
 CREATE (scheduleSurface)-[:HAS_COLUMN]->(g4)
 
+// Project Intake — form renderer demo: multi-record editing + validation rules.
+// Rules live on the Column nodes and are enforced server-side on every write:
+// required, min/max (numeric), minLength/maxLength, pattern, options (enum).
+CREATE (h1:Column {id: 'colh_customer', field: 'customer', label: 'Customer', order: 1, source: '<HAS_PROJECT:Customer.name', suggest: true, type: 'string', required: true})
+CREATE (h2:Column {id: 'colh_project', field: 'project', label: 'Project Title', order: 2, source: 'self.name', type: 'string', required: true, minLength: 4, maxLength: 120, validationMessage: 'Project title must be 4-120 characters'})
+CREATE (h3:Column {id: 'colh_status', field: 'status', label: 'Status', order: 3, source: '>HAS_STATUS:Status.name', suggest: true, type: 'string'})
+CREATE (h4:Column {id: 'colh_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner', suggest: true, type: 'string', required: true})
+CREATE (h5:Column {id: 'colh_priority', field: 'priority', label: 'Priority', order: 5, source: 'self.priority', type: 'string', required: true, options: ['Low', 'Medium', 'High']})
+CREATE (h6:Column {id: 'colh_budget', field: 'budget', label: 'Budget (USD)', order: 6, source: 'self.budget', type: 'money', min: 0, max: 1000000})
+CREATE (h7:Column {id: 'colh_start', field: 'start', label: 'Start', order: 7, source: 'self.start', type: 'date', required: true})
+CREATE (h8:Column {id: 'colh_due', field: 'due', label: 'Due', order: 8, source: 'self.due', type: 'date', required: true})
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h1)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h2)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h3)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h4)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h5)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h6)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h7)
+CREATE (intakeSurface)-[:HAS_COLUMN]->(h8)
+
+// Customer Analytics — aggregate sources demo: rows are Customers; columns
+// compute sums / averages / extremes over the typed HAS_PROJECT relationship.
+// Read-only columns (aggregates are derived, never written).
+CREATE (a1:Column {id: 'cola_customer', field: 'customer', label: 'Customer', order: 1, source: 'self.name', type: 'string', suggest: true})
+CREATE (a2:Column {id: 'cola_projects', field: 'projects', label: 'Projects', order: 2, source: '>HAS_PROJECT:Project.count', type: 'number'})
+CREATE (a3:Column {id: 'cola_total', field: 'total', label: 'Total Budget', order: 3, source: '>HAS_PROJECT:Project.budget.sum', type: 'money'})
+CREATE (a4:Column {id: 'cola_avg', field: 'average', label: 'Average Budget', order: 4, source: '>HAS_PROJECT:Project.budget.avg', type: 'money'})
+CREATE (a5:Column {id: 'cola_max', field: 'largest', label: 'Largest Project', order: 5, source: '>HAS_PROJECT:Project.budget.max', type: 'money'})
+CREATE (a6:Column {id: 'cola_min', field: 'smallest', label: 'Smallest Project', order: 6, source: '>HAS_PROJECT:Project.budget.min', type: 'money'})
+CREATE (analyticsSurface)-[:HAS_COLUMN]->(a1)
+CREATE (analyticsSurface)-[:HAS_COLUMN]->(a2)
+CREATE (analyticsSurface)-[:HAS_COLUMN]->(a3)
+CREATE (analyticsSurface)-[:HAS_COLUMN]->(a4)
+CREATE (analyticsSurface)-[:HAS_COLUMN]->(a5)
+CREATE (analyticsSurface)-[:HAS_COLUMN]->(a6)
+
 // ---- Business data -------------------------------------------------------
 CREATE (acme:Customer {id: 'customer_acme', name: 'Acme Corp'})
 CREATE (globex:Customer {id: 'customer_globex', name: 'Globex'})
 CREATE (initech:Customer {id: 'customer_initech', name: 'Initech'})
-CREATE (project1:Project {id: 'project_redesign', name: 'Website Redesign', owner: 'John Doe', budget: 24000, start: '2026-01-05', due: '2026-03-20'})
-CREATE (project2:Project {id: 'project_app', name: 'Mobile App', owner: 'Jane Smith', budget: 68000, start: '2026-02-01', due: '2026-06-30'})
-CREATE (project3:Project {id: 'project_platform', name: 'Data Platform', owner: 'Ada Admin', budget: 120000, start: '2026-04-10', due: '2026-09-15'})
-CREATE (project4:Project {id: 'project_crm', name: 'CRM Migration', owner: 'John Doe', budget: 45000, start: '2026-01-15', due: '2026-04-30'})
-CREATE (project5:Project {id: 'project_analytics', name: 'Analytics Portal', owner: 'Ada Admin', budget: 88000, start: '2026-05-01', due: '2026-08-31'})
+CREATE (project1:Project {id: 'project_redesign', name: 'Website Redesign', owner: 'John Doe', budget: 24000, start: '2026-01-05', due: '2026-03-20', priority: 'High'})
+CREATE (project2:Project {id: 'project_app', name: 'Mobile App', owner: 'Jane Smith', budget: 68000, start: '2026-02-01', due: '2026-06-30', priority: 'Medium'})
+CREATE (project3:Project {id: 'project_platform', name: 'Data Platform', owner: 'Ada Admin', budget: 120000, start: '2026-04-10', due: '2026-09-15', priority: 'High'})
+CREATE (project4:Project {id: 'project_crm', name: 'CRM Migration', owner: 'John Doe', budget: 45000, start: '2026-01-15', due: '2026-04-30', priority: 'Medium'})
+CREATE (project5:Project {id: 'project_analytics', name: 'Analytics Portal', owner: 'Ada Admin', budget: 88000, start: '2026-05-01', due: '2026-08-31', priority: 'Low'})
 CREATE (active:Status {id: 'status_active', name: 'Active'})
 CREATE (draft:Status {id: 'status_draft', name: 'Draft'})
 CREATE (done:Status {id: 'status_done', name: 'Done'})
@@ -135,6 +173,14 @@ CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: f
 CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(pivotSurface)
 CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
 CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
+
+// Project Intake — Sales can create + edit records (multi-record editing demo); Analyst read-only.
+CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(intakeSurface)
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(intakeSurface)
+
+// Customer Analytics — read-only + export for everyone (aggregate columns are derived).
+CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
 `;
 
 async function seed() {
@@ -143,7 +189,7 @@ async function seed() {
     for (const constraint of constraints) await session.run(constraint);
     await session.run(clearQuery);
     await session.run(query);
-    console.log("Seeded admin, 2 demo users, 6 multi-source surfaces, typed columns and permissions.");
+    console.log("Seeded admin, 2 demo users, 8 multi-source surfaces (form intake + aggregate analytics), validation rules and permissions.");
   } finally {
     await session.close();
     await driver.close();

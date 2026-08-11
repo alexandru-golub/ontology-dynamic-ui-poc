@@ -19,6 +19,15 @@ export type TableColumn = {
   suggest?: boolean;
   suggestSource?: string | null;
   type?: ColumnType;
+  // ---- per-field validation rules (mirror of the graph data) ----
+  required?: boolean;
+  min?: number | null;
+  max?: number | null;
+  minLength?: number | null;
+  maxLength?: number | null;
+  pattern?: string | null;
+  options?: string[] | null;
+  validationMessage?: string | null;
 };
 export type TableRowData = { id: string; values: Record<string, unknown> };
 

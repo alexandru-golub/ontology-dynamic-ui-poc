@@ -29,7 +29,7 @@ Open http://localhost:3000. Neo4j Browser: http://localhost:7477 (neo4j / local-
 | User | Role | Capabilities |
 | ---- | ---- | ------------ |
 | Ada Admin (`admin_001`) | Super admin (`isAdmin: true`) | Everything + **Admin console** (users, roles, grants, overrides, surfaces, **audit trail**) |
-| John Doe (`user_101`) | Sales | Row CRUD on Project Overview (delete via override), manage on Customer Portfolio, **drag cards between lanes on Project Board** |
+| John Doe (`user_101`) | Sales | Row CRUD on Project Overview (delete via override), manage on Customer Portfolio, **drag cards between lanes on Project Board**, **multi-record editing on Project Intake** |
 | Jane Smith (`user_202`) | Analyst | Read-only + export everywhere |
 
 ## The ideas
@@ -58,6 +58,9 @@ carries a `source` that tells the projector where to pull the value from:
 | `self.<prop>` | property on the row's root node | `self.budget` |
 | `<Label>.<prop>` | property of a *neighboring* node of that label (any relationship) | `Customer.name`, `Status.name`, `Role.name` |
 | `<Label>.count` | number of neighboring nodes of that label | `Project.count` |
+| `<Label>.<prop>.sum` / `.avg` / `.min` / `.max` | numeric aggregate over neighboring nodes (any relationship) | `Project.budget.sum` |
+| `>Rel:Label.<prop>.sum` / `.avg` / `.min` / `.max` | numeric aggregate over a **typed** relationship | `>HAS_PROJECT:Project.budget.avg` |
+| `<Rel:Label.<prop>.sum` / `.avg` / `.min` / `.max` | same, incoming relationship | `<HAS_TASK:Task.estimate.max` |
 | `>Rel:Label.<prop>` | property of a node reached via an **outgoing** typed relationship | `>HAS_STATUS:Status.name` |
 | `<Rel:Label.<prop>` | property of a node reached via an **incoming** typed relationship | `<HAS_PROJECT:Customer.name` |
 | `>Rel:Label.count` / `<Rel:Label.count` | count over a typed relationship | `<HAS_PROJECT:Project.count` |
@@ -66,7 +69,15 @@ Typed sources make the relationship explicit, so **row writes** can create/relin
 those neighbors generically (any `Label.prop` column with a known relationship
 is writable — not just the hardcoded Customer/Status/Role set).
 
-Seeded examples of one surface mixing many node types:
+**Aggregate sources** (`sum`/`avg`/`min`/`max`) compute numeric rollups over the
+matched neighbors — e.g. a customer's total project budget. They are
+**read-only** (derived values are never written back) and work with
+server-side filters/search/sort like any other column. Each aggregate runs in
+its own `CALL { }` subquery so the value is exact even when a surface mixes
+several multi-match columns (plain `OPTIONAL MATCH` chains multiply rows, which
+would corrupt `sum`).
+
+Seeded surfaces:
 - **Project Overview** — rows are `Project` nodes; columns come from the
   project itself (`name`, `owner`, `budget`), its `Customer` and its `Status`.
 - **Customer Portfolio** — rows are `Customer` nodes; columns show the
@@ -78,6 +89,11 @@ Seeded examples of one surface mixing many node types:
   board grouped by `Status`; Sales can drag projects between Active / Draft / Done.
 - **Project Pivot** — `pivot` renderer: customers × statuses, cells sum budgets.
 - **Project Schedule** — `gantt` renderer: projects as date bars (Start → Due).
+- **Project Intake** — `form` renderer: record list + single/multi-record editor with
+  per-field validation rules (required, min/max budget, enum Priority) demoed end-to-end.
+- **Customer Analytics** — `table` renderer: **aggregate sources** — for every
+  customer: project count, total / average / largest / smallest project budget
+  computed from `>HAS_PROJECT:Project.budget.sum|avg|min|max`.
 
 Adding a column with a new source is a graph write — no frontend code needed.
 
@@ -97,7 +113,7 @@ shares one source of options. New values are still allowed.
 | ------- | ------- |
 | `Column.suggest` | on/off for the field |
 | `Column.suggestSource` | optional node label to draw options from (defaults to the column's neighbor label, or the surface root label for `self.*` sources) |
-| Admin surface creator | columns line format `field|label|source|order|suggest`, e.g. `customer|Customer Name|Customer.name|2|yes` |
+| Admin surface creator | columns line format `field|label|source|order|suggest|type|required|min|max|minLength|maxLength|pattern|options`, e.g. `priority|Priority|self.priority|5|no|string|yes|Low,Medium,High` |
 
 `getSurface` returns `suggestions { field values }` for suggest-enabled columns.
 
@@ -109,7 +125,7 @@ shares one source of options. New values are still allowed.
 | -------- | ------------- |
 | `table` | editable DataTable (sorting, filter, inline edit, selection, Load more) |
 | `cards` | card grid with per-card selection |
-| `form` | record list + editable form (create/update) |
+| `form` | record list + editable form — v2: **multi-record (bulk) editing** + per-field validation errors |
 | `board` | kanban lanes grouped by a status-like column; **drag cards between lanes** to re-group (writes the grouping field) |
 | `timeline` | vertical feed of records |
 | `pivot` | aggregate grid (row dim, col dim, value) with totals |
@@ -145,7 +161,40 @@ editors: number/date inputs, a yes/no select for booleans, suggestion comboboxes
 where enabled. Set the type in the surface creator (`field|label|source|order|suggest|type`)
 or the Manage-surface dialog.
 
-### 8. Audit trail
+### 8. Per-field validation rules + form renderer v2
+Every column can carry **validation rules as graph data** — same as everything else
+in this app. They are stored on the `Column` node, returned in
+`ColumnMetadata`, and **enforced server-side on every write** (`createRow`,
+`updateRow` — including table inline edits, board drags and the form):
+
+| Rule | Meaning | Example |
+| ---- | ------- | ------- |
+| `required` | value must be non-blank | `required: true` on Customer |
+| `min` / `max` | numeric lower/upper bound (number/money columns) | Budget `min: 0, max: 1000000` |
+| `minLength` / `maxLength` | string length bounds | Project Title `minLength: 4, maxLength: 120` |
+| `pattern` | value must match a regex | `^[A-Z]{2}\d{4}$` for a code field |
+| `options` | enum — value must be one of the listed strings (renders a dropdown) | Priority `["Low","Medium","High"]` |
+| `validationMessage` | optional custom error text | "Project title must be 4-120 characters" |
+
+Validation is checked **client-side first** (instant inline errors, no wasted
+round-trips) and **again server-side** on every mutation — the server is the
+security boundary, so a bad value can never corrupt the graph no matter how it
+is sent. Server errors aggregate all failing fields into one message
+(`extensions.fields` lists them).
+
+**Form renderer v2** builds on that:
+- **Multi-record editing** — tick several records in the list to open a bulk
+  editor; tick a field, type the new value, and it is applied to every selected
+  record (unticked fields stay untouched). Each record still gets its own
+  `updateRow` + audit event.
+- **Inline validation** — required/enum/range/length/pattern errors render under
+  the field with a destructive border; the form never submits an invalid record.
+- Options columns render as dropdowns; enum values also feed suggestions.
+
+Set rules when creating a surface (admin console, extended column line) or any
+time from **Manage surface → Edit column**.
+
+### 9. Audit trail
 Every row create/update/delete and every surface/column definition change writes
 an `AuditEvent` node (`(User)-[:PERFORMED]->(AuditEvent)`) in the same
 transaction as the change: actor, action, surface, target and a JSON `changes`
@@ -153,12 +202,15 @@ diff (`{ field: { from, to } }` for updates, full values for create/delete).
 The admin console's **Audit** tab lists the trail newest-first with Load more;
 `auditEvents` is admin-only.
 
-### 9. Guardrails
+### 10. Guardrails
 - **Unique constraints** (created by `npm run seed`) on `User.id`, `Surface.id`,
   `Column.id`, `Role.name`, `Customer.name`, `Status.name`, `Project.id`;
   duplicate creates return friendly errors.
 - **Validation** at write time: `rootLabel` must be a valid label, `source` must
-  match one of the documented syntaxes, `renderer` must be in the registry.
+  match one of the documented syntaxes, `renderer` must be in the registry,
+  column `type` must be known, and **per-column validation rules**
+  (`required`/`min`/`max`/`minLength`/`maxLength`/`pattern`/`options`) are
+  enforced on every row write (all renderers, all entry points).
 - **Soft delete** for surfaces: `adminDeleteSurface` archives (`deleted: true`),
   `adminRestoreSurface` brings it back, `adminPurgeSurface` hard-deletes.
   Archived surfaces are hidden from `getSurface`/`listSurfaces` and flagged in
@@ -166,7 +218,7 @@ The admin console's **Audit** tab lists the trail newest-first with Load more;
 
 ## API surface
 
-`Query`: `me`, `getSurface` (incl. `suggestions` + column `type`), `surfaceRows(surfaceId, first, after, search, filters, orderBy)` (paged connection), `listSurfaces`, `auditEvents` (admin), `adminUsers`, `adminRoles`, `adminSurfaces`
+`Query`: `me`, `getSurface` (incl. `suggestions`, column `type` **and validation rules**), `surfaceRows(surfaceId, first, after, search, filters, orderBy)` (paged connection), `listSurfaces`, `auditEvents` (admin), `adminUsers`, `adminRoles`, `adminSurfaces`
 `Mutation`:
 - rows: `createRow`, `updateRow`, `deleteRows` (generic over the surface's root label)
 - surface definitions: `updateSurface`, `addColumn`, `updateColumn`, `deleteColumn`
@@ -180,7 +232,7 @@ The admin console's **Audit** tab lists the trail newest-first with Load more;
 ```
 (User)-[:HAS_ROLE]->(Role)-[:CAN_ACCESS {view,create,update,delete,export,manage}]->(Surface)
 (User)-[:SURFACE_OVERRIDE {view?,create?,...}]->(Surface)   // per-user boolean override
-(Surface)-[:HAS_COLUMN]->(Column {field,label,order,source,suggest,suggestSource})  // source: self.prop | >Rel:Label.prop | <Rel:Label.prop | Label.count
+(Surface)-[:HAS_COLUMN]->(Column {field,label,order,source,suggest,suggestSource,type,required,min,max,minLength,maxLength,pattern,options,validationMessage})  // source: self.prop | >Rel:Label.prop | <Rel:Label.prop | Label.count
 (Any root node, e.g. Project)-[:HAS_STATUS]->(Status)        // whatever the sources point at
 ```
 
@@ -206,7 +258,10 @@ Status legend: ✅ implemented · 🔜 next · 💭 later.
 - ✅ **New renderers** — `pivot` (aggregate grid with totals) and `gantt`
   (date bars over a shared timeline), both configured positionally from the
   surface's columns. Seeded surfaces: Project Pivot, Project Schedule.
-- 🔜 **Form renderer v2** — multi-record editing, per-field validation rules.
+- ✅ **Form renderer v2** — multi-record (bulk) editing + per-field validation
+  rules (required / min / max / minLength / maxLength / pattern / options),
+  enforced server-side on every write and shown inline in the form, create
+  dialog and table editor.
 - 💭 **More renderers** — calendar, nested-detail tables; each new renderer is
   one more entry in the registry.
 
@@ -218,8 +273,12 @@ Status legend: ✅ implemented · 🔜 next · 💭 later.
 - ✅ **Search & filters server-side** — `surfaceRows(search, filters, orderBy)`
   filters/orders inside the connection; count, paging, board lanes and CSV
   export all respect the filtered set.
-- 💭 **Computed/aggregate sources** — e.g. `sum`, `avg`, `max` over typed
-  relationships (`>HAS_LINE_ITEM:LineItem.total.sum`), stored as column sources.
+- ✅ **Computed/aggregate sources** — `sum` / `avg` / `min` / `max` over typed
+  relationships (`>HAS_PROJECT:Project.budget.sum`) or any-neighbor
+  (`Project.budget.avg`); read-only columns, exact under multi-match surfaces
+  (isolated `CALL` subqueries), filterable/sortable/searchable like any column.
+- 💭 **More aggregate shapes** — `count` distinct props, date-bucketed rollups,
+  and aggregate *writes* (recompute-on-write) are natural next steps.
 
 ### Schema evolution & guardrails
 - ✅ **Unique constraints** on node ids/names; friendly duplicate errors.
@@ -228,6 +287,10 @@ Status legend: ✅ implemented · 🔜 next · 💭 later.
 - ✅ **Soft delete** for surfaces (archive / restore / purge).
 - ✅ **Field typing on columns** — `string | number | boolean | date | money`
   with per-column validation; type-aware editors in table/form/create dialogs.
+- ✅ **Per-column validation rules** — `required`, `min`/`max`,
+  `minLength`/`maxLength`, `pattern`, `options` (enum) and custom messages as
+  graph data on `Column`; enforced on every mutation server-side with
+  aggregated error reporting, and surfaced inline in the form renderer.
 - ✅ **Audit trail** — `AuditEvent` nodes on row CRUD and surface/column
   definition changes (actor, action, diff), browsable from the admin console.
 - 💭 **Versioned surface definitions** — snapshot a surface's columns on change

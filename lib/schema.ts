@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { sanitizeColumnType, sanitizeLabel as validateRootLabel } from "./db";
-import { GraphQLScalarType, Kind, buildSchema } from "graphql";
+import { GraphQLError, GraphQLScalarType, Kind, buildSchema } from "graphql";
 import { driver } from "./neo4j";
 import {
   type Column,
@@ -42,6 +42,7 @@ import {
   updateRow,
   validateRenderer,
   validateSource,
+  sanitizeValidationRules,
 } from "./db";
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,15 @@ type ColumnMetadata {
   suggest: Boolean!
   suggestSource: String
   type: String!
+  # ---- per-field validation rules (enforced server-side on every write) ----
+  required: Boolean!
+  min: Float
+  max: Float
+  minLength: Int
+  maxLength: Int
+  pattern: String
+  options: [String!]
+  validationMessage: String
 }
 
 enum FilterOp {
@@ -210,6 +220,14 @@ input ColumnInput {
   suggest: Boolean
   suggestSource: String
   type: String
+  required: Boolean
+  min: Float
+  max: Float
+  minLength: Int
+  maxLength: Int
+  pattern: String
+  options: [String!]
+  validationMessage: String
 }
 
 input ColumnPatchInput {
@@ -220,6 +238,14 @@ input ColumnPatchInput {
   suggest: Boolean
   suggestSource: String
   type: String
+  required: Boolean
+  min: Float
+  max: Float
+  minLength: Int
+  maxLength: Int
+  pattern: String
+  options: [String!]
+  validationMessage: String
 }
 
 input PermissionInput {
@@ -442,11 +468,12 @@ export function getSchema(userId: string) {
 
   mutationType.getFields().addColumn.resolve = async (
     _source,
-    { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string; type?: string } },
+    { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string; type?: string; required?: boolean; min?: number | null; max?: number | null; minLength?: number | null; maxLength?: number | null; pattern?: string | null; options?: string[] | null; validationMessage?: string | null } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
     validateSource(input.source, input.field);
     const columnType = sanitizeColumnType(input.type);
+    const rules = sanitizeValidationRules(input);
     const surface = await getSurfaceMeta(surfaceId);
     const order = input.order ?? Math.max(0, ...surface.columns.map((c) => c.order)) + 1;
     const columnId = `column_${randomUUID()}`;
@@ -454,7 +481,24 @@ export function getSchema(userId: string) {
     try {
       await session.run(
         `MATCH (s:Surface {id: $surfaceId})
-         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source, suggest: $suggest, suggestSource: $suggestSource, type: $type})
+         CREATE (c:Column {
+           id: $columnId,
+           field: $field,
+           label: $label,
+           order: toInteger($order),
+           source: $source,
+           suggest: $suggest,
+           suggestSource: $suggestSource,
+           type: $type,
+           required: $required,
+           min: $min,
+           max: $max,
+           minLength: $minLength,
+           maxLength: $maxLength,
+           pattern: $pattern,
+           options: $options,
+           validationMessage: $validationMessage
+         })
          CREATE (s)-[:HAS_COLUMN]->(c)`,
         {
           surfaceId,
@@ -466,6 +510,14 @@ export function getSchema(userId: string) {
           suggest: input.suggest ?? false,
           suggestSource: input.suggestSource ?? null,
           type: columnType,
+          required: rules.required,
+          min: rules.min,
+          max: rules.max,
+          minLength: rules.minLength,
+          maxLength: rules.maxLength,
+          pattern: rules.pattern,
+          options: rules.options,
+          validationMessage: rules.validationMessage,
         },
       );
     } finally {
@@ -477,19 +529,67 @@ export function getSchema(userId: string) {
 
   mutationType.getFields().updateColumn.resolve = async (
     _source,
-    { surfaceId, columnId, input }: { surfaceId: string; columnId: string; input: { field?: string; label?: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string; type?: string } },
+    { surfaceId, columnId, input }: {
+      surfaceId: string;
+      columnId: string;
+      input: { field?: string; label?: string; order?: number; source?: string | null; suggest?: boolean; suggestSource?: string | null; type?: string; required?: boolean; min?: number | null; max?: number | null; minLength?: number | null; maxLength?: number | null; pattern?: string | null; options?: string[] | null; validationMessage?: string | null };
+    },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
     if (input.source != null) validateSource(input.source, input.field ?? "field");
     const columnType = input.type === undefined ? undefined : sanitizeColumnType(input.type);
+    const surface = await getSurfaceMeta(surfaceId);
+    const existing = surface.columns.find((c) => c.id === columnId);
+    if (!existing) {
+      throw new GraphQLError("Column not found on this surface", { extensions: { code: "NOT_FOUND" } });
+    }
+    // Merge in JS so explicit nulls can *clear* a rule (coalesce cannot).
+    const merged = {
+      ...existing,
+      field: input.field ?? existing.field,
+      label: input.label ?? existing.label,
+      order: input.order ?? existing.order,
+      source: input.source !== undefined ? input.source ?? null : existing.source,
+      suggest: input.suggest ?? existing.suggest,
+      suggestSource: input.suggestSource !== undefined ? input.suggestSource ?? null : existing.suggestSource,
+      type: columnType ?? existing.type,
+      required: input.required ?? existing.required,
+      min: input.min !== undefined ? input.min ?? null : existing.min,
+      max: input.max !== undefined ? input.max ?? null : existing.max,
+      minLength: input.minLength !== undefined ? input.minLength ?? null : existing.minLength,
+      maxLength: input.maxLength !== undefined ? input.maxLength ?? null : existing.maxLength,
+      pattern: input.pattern !== undefined ? (input.pattern?.trim() || null) : existing.pattern,
+      options: input.options !== undefined ? input.options ?? null : existing.options,
+      validationMessage: input.validationMessage !== undefined ? (input.validationMessage?.trim() || null) : existing.validationMessage,
+    };
+    const rules = sanitizeValidationRules(merged);
     const session = driver.session({ defaultAccessMode: "WRITE" });
     try {
       await session.run(
         `MATCH (c:Column) WHERE elementId(c) = $columnId
-         SET c.field = coalesce($field, c.field), c.label = coalesce($label, c.label), c.order = coalesce($order, c.order),
-             c.source = coalesce($source, c.source), c.suggest = coalesce($suggest, c.suggest), c.suggestSource = coalesce($suggestSource, c.suggestSource),
-             c.type = coalesce($type, c.type)`,
-        { columnId, field: input.field ?? null, label: input.label ?? null, order: input.order ?? null, source: input.source ?? null, suggest: input.suggest ?? null, suggestSource: input.suggestSource ?? null, type: columnType ?? null },
+         SET c.field = $field, c.label = $label, c.order = toInteger($order), c.source = $source,
+             c.suggest = $suggest, c.suggestSource = $suggestSource, c.type = $type,
+             c.required = $required, c.min = $min, c.max = $max,
+             c.minLength = $minLength, c.maxLength = $maxLength,
+             c.pattern = $pattern, c.options = $options, c.validationMessage = $validationMessage`,
+        {
+          columnId,
+          field: merged.field,
+          label: merged.label,
+          order: merged.order,
+          source: merged.source,
+          suggest: merged.suggest,
+          suggestSource: merged.suggestSource,
+          type: merged.type,
+          required: rules.required,
+          min: rules.min,
+          max: rules.max,
+          minLength: rules.minLength,
+          maxLength: rules.maxLength,
+          pattern: rules.pattern,
+          options: rules.options,
+          validationMessage: rules.validationMessage,
+        },
       );
     } finally {
       await session.close();
@@ -595,7 +695,31 @@ export function getSchema(userId: string) {
 
   mutationType.getFields().adminCreateSurface.resolve = async (
     _source,
-    { input }: { input: { id: string; title: string; renderer?: string; rootLabel?: string; columns?: Array<{ field: string; label: string; order?: number; source?: string }> } },
+    { input }: {
+      input: {
+        id: string;
+        title: string;
+        renderer?: string;
+        rootLabel?: string;
+        columns?: Array<{
+          field: string;
+          label: string;
+          order?: number;
+          source?: string;
+          suggest?: boolean;
+          suggestSource?: string;
+          type?: string;
+          required?: boolean;
+          min?: number | null;
+          max?: number | null;
+          minLength?: number | null;
+          maxLength?: number | null;
+          pattern?: string | null;
+          options?: string[] | null;
+          validationMessage?: string | null;
+        }>;
+      };
+    },
   ) => {
     await requireAdmin(userId);
     return adminCreateSurface(input);

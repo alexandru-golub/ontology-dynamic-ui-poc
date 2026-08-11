@@ -410,15 +410,24 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => {
-        // field|label|source|order|suggest(yes/no)|type
-        const [field, label, source, order, suggest, type] = line.split("|").map((s) => s?.trim());
+        // field|label|source|order|suggest|type|required|min|max|minLength|maxLength|pattern|options
+        const parts = line.split("|").map((s) => s?.trim());
+        const [field, label, source, order, suggest, type, required, min, max, minLength, maxLength, pattern, options] = parts;
+        const num = (value: string | undefined) => (value === undefined || value === "" ? undefined : Number(value));
         return {
           field,
           label,
           source: source || undefined,
-          order: order ? Number(order) : undefined,
+          order: num(order),
           suggest: ["yes", "1", "true"].includes((suggest ?? "").toLowerCase()),
           type: type || undefined,
+          required: ["yes", "1", "true"].includes((required ?? "").toLowerCase()),
+          min: num(min),
+          max: num(max),
+          minLength: num(minLength),
+          maxLength: num(maxLength),
+          pattern: pattern || undefined,
+          options: options ? options.split(",").map((o) => o.trim()).filter(Boolean) : undefined,
         };
       })
       .filter((c) => c.field && c.label);
@@ -856,7 +865,8 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
             <DialogTitle>Create surface</DialogTitle>
             <DialogDescription>
               Rows are rooted at a node label. Columns pull from any source: <code className="text-xs">self.prop</code>,{" "}
-              <code className="text-xs">Label.prop</code>, <code className="text-xs">Label.count</code>.
+              <code className="text-xs">Label.prop</code>, <code className="text-xs">Label.count</code>, aggregates{" "}
+              <code className="text-xs">Label.prop.sum|avg|min|max</code>.
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-3">
@@ -887,12 +897,15 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="ns-columns">
-                Columns — one per line: <code className="text-xs">field|label|source|order|suggest</code>
+                Columns — one per line:{" "}
+                <code className="text-xs">field|label|source|order|suggest|type|required|min|max|minLength|maxLength|pattern|options</code>
               </Label>
               <textarea
                 id="ns-columns"
                 className="flex min-h-[110px] w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                placeholder={"customer|Customer Name|Customer.name|1|yes\nproject|Project|self.name|2\nstatus|Status|Status.name|3|yes\nowners|Owners|Owner.count|4"}
+                placeholder={
+                  "customer|Customer Name|Customer.name|1|yes|string|yes\nproject|Project Title|self.name|2|no|string|yes|0|||120\npriority|Priority|self.priority|3|no|string|yes|Low,Medium,High\nbudget|Budget (USD)|self.budget|4|no|money|no|0|1000000"
+                }
                 value={newSurface.columns}
                 onChange={(e) => setNewSurface((p) => ({ ...p, columns: e.target.value }))}
               />
