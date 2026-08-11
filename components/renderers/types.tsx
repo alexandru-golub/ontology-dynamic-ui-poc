@@ -1,4 +1,4 @@
-import type { TableColumn, TableRowData } from "@/components/data-table";
+import type { SortState, TableColumn, TableRowData } from "@/components/data-table";
 
 export type RendererProps = {
   title: string;
@@ -16,6 +16,9 @@ export type RendererProps = {
   hasNextPage?: boolean;
   totalCount?: number;
   onLoadMore?: () => void;
+  /** Server-side sort for the table renderer (connection re-queries on change). */
+  sort?: SortState;
+  onSortChange?: (sort: SortState) => void;
 };
 
 export function sortedColumns(columns: TableColumn[]): TableColumn[] {

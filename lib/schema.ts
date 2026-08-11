@@ -1,11 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { sanitizeLabel as validateRootLabel } from "./db";
+import { sanitizeColumnType, sanitizeLabel as validateRootLabel } from "./db";
 import { GraphQLScalarType, Kind, buildSchema } from "graphql";
 import { driver } from "./neo4j";
 import {
   type Column,
+  type ColumnFilter,
+  type ColumnOrder,
   type Permissions,
   type SurfaceRow,
+  auditEventsPage,
+  writeAudit,
   adminAssignRole,
   adminClearOverride,
   adminCreateRole,
@@ -54,6 +58,55 @@ type ColumnMetadata {
   source: String
   suggest: Boolean!
   suggestSource: String
+  type: String!
+}
+
+enum FilterOp {
+  eq
+  neq
+  contains
+  gt
+  lt
+}
+
+input ColumnFilterInput {
+  field: String!
+  op: FilterOp!
+  value: String
+}
+
+enum OrderDirection {
+  ASC
+  DESC
+}
+
+input ColumnOrderInput {
+  field: String!
+  direction: OrderDirection!
+}
+
+type AuditEvent {
+  id: ID!
+  at: String!
+  actorId: String!
+  actorName: String!
+  action: String!
+  surfaceId: String
+  surfaceTitle: String
+  targetId: String
+  targetLabel: String
+  changes: JSON
+}
+
+type AuditEventEdge {
+  cursor: String!
+  node: AuditEvent!
+}
+
+type AuditEventConnection {
+  edges: [AuditEventEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
 }
 
 type SuggestionGroup {
@@ -156,6 +209,7 @@ input ColumnInput {
   source: String
   suggest: Boolean
   suggestSource: String
+  type: String
 }
 
 input ColumnPatchInput {
@@ -165,6 +219,7 @@ input ColumnPatchInput {
   source: String
   suggest: Boolean
   suggestSource: String
+  type: String
 }
 
 input PermissionInput {
@@ -198,7 +253,15 @@ input AdminSurfaceInput {
 type Query {
   me: UserInfo!
   getSurface(surfaceId: ID!): SurfacePayload!
-  surfaceRows(surfaceId: ID!, first: Int, after: String): SurfaceRowConnection!
+  surfaceRows(
+    surfaceId: ID!
+    first: Int
+    after: String
+    search: String
+    filters: [ColumnFilterInput!]
+    orderBy: ColumnOrderInput
+  ): SurfaceRowConnection!
+  auditEvents(first: Int, after: String): AuditEventConnection!
   listSurfaces: [SurfaceSummary!]!
   adminUsers: [AdminUser!]!
   adminRoles: [RoleInfo!]!
@@ -292,11 +355,23 @@ export function getSchema(userId: string) {
 
   queryType.getFields().surfaceRows.resolve = async (
     _source,
-    { surfaceId, first, after }: { surfaceId: string; first?: number; after?: string },
+    args: { surfaceId: string; first?: number; after?: string; search?: string; filters?: ColumnFilter[]; orderBy?: ColumnOrder | null },
   ) => {
-    await requirePermission(userId, surfaceId, "view");
-    const surface = await getSurfaceMeta(surfaceId);
-    return surfaceRowsPage(surface, first ?? 50, after ?? undefined);
+    await requirePermission(userId, args.surfaceId, "view");
+    const surface = await getSurfaceMeta(args.surfaceId);
+    return surfaceRowsPage(surface, args.first ?? 50, args.after ?? undefined, {
+      filters: args.filters,
+      search: args.search,
+      orderBy: args.orderBy,
+    });
+  };
+
+  queryType.getFields().auditEvents.resolve = async (
+    _source,
+    { first, after }: { first?: number; after?: string },
+  ) => {
+    await requireAdmin(userId);
+    return auditEventsPage(first ?? 50, after ?? undefined);
   };
 
   queryType.getFields().listSurfaces.resolve = async () => listSurfaces(userId);
@@ -322,7 +397,7 @@ export function getSchema(userId: string) {
     { surfaceId, values }: { surfaceId: string; values: Record<string, unknown> },
   ) => {
     await requirePermission(userId, surfaceId, "create");
-    return createRow(surfaceId, values);
+    return createRow(surfaceId, values, userId);
   };
 
   mutationType.getFields().updateRow.resolve = async (
@@ -330,7 +405,7 @@ export function getSchema(userId: string) {
     { surfaceId, id, values }: { surfaceId: string; id: string; values: Record<string, unknown> },
   ) => {
     await requirePermission(userId, surfaceId, "update");
-    return updateRow(surfaceId, id, values);
+    return updateRow(surfaceId, id, values, userId);
   };
 
   mutationType.getFields().deleteRows.resolve = async (
@@ -338,7 +413,7 @@ export function getSchema(userId: string) {
     { surfaceId, ids }: { surfaceId: string; ids: string[] },
   ) => {
     await requirePermission(userId, surfaceId, "delete");
-    return deleteRows(ids);
+    return deleteRows(surfaceId, ids, userId);
   };
 
   // ---------------- Surface definition CRUD ----------------
@@ -361,57 +436,65 @@ export function getSchema(userId: string) {
     } finally {
       await session.close();
     }
+    await writeAudit({ actorId: userId, action: "UPDATE", surfaceId, targetId: surfaceId, targetLabel: "Surface", changes: input });
     return refreshSurfacePayload(surfaceId);
   };
 
   mutationType.getFields().addColumn.resolve = async (
     _source,
-    { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string } },
+    { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string; type?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
     validateSource(input.source, input.field);
+    const columnType = sanitizeColumnType(input.type);
     const surface = await getSurfaceMeta(surfaceId);
     const order = input.order ?? Math.max(0, ...surface.columns.map((c) => c.order)) + 1;
+    const columnId = `column_${randomUUID()}`;
     const session = driver.session({ defaultAccessMode: "WRITE" });
     try {
       await session.run(
         `MATCH (s:Surface {id: $surfaceId})
-         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source, suggest: $suggest, suggestSource: $suggestSource})
+         CREATE (c:Column {id: $columnId, field: $field, label: $label, order: toInteger($order), source: $source, suggest: $suggest, suggestSource: $suggestSource, type: $type})
          CREATE (s)-[:HAS_COLUMN]->(c)`,
         {
           surfaceId,
-          columnId: `column_${randomUUID()}`,
+          columnId,
           field: input.field,
           label: input.label,
           order,
           source: input.source ?? null,
           suggest: input.suggest ?? false,
           suggestSource: input.suggestSource ?? null,
+          type: columnType,
         },
       );
     } finally {
       await session.close();
     }
+    await writeAudit({ actorId: userId, action: "CREATE", surfaceId, targetId: columnId, targetLabel: "Column", changes: input });
     return refreshSurfacePayload(surfaceId);
   };
 
   mutationType.getFields().updateColumn.resolve = async (
     _source,
-    { surfaceId, columnId, input }: { surfaceId: string; columnId: string; input: { field?: string; label?: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string } },
+    { surfaceId, columnId, input }: { surfaceId: string; columnId: string; input: { field?: string; label?: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string; type?: string } },
   ) => {
     await requirePermission(userId, surfaceId, "manage");
     if (input.source != null) validateSource(input.source, input.field ?? "field");
+    const columnType = input.type === undefined ? undefined : sanitizeColumnType(input.type);
     const session = driver.session({ defaultAccessMode: "WRITE" });
     try {
       await session.run(
         `MATCH (c:Column) WHERE elementId(c) = $columnId
          SET c.field = coalesce($field, c.field), c.label = coalesce($label, c.label), c.order = coalesce($order, c.order),
-             c.source = coalesce($source, c.source), c.suggest = coalesce($suggest, c.suggest), c.suggestSource = coalesce($suggestSource, c.suggestSource)`,
-        { columnId, field: input.field ?? null, label: input.label ?? null, order: input.order ?? null, source: input.source ?? null, suggest: input.suggest ?? null, suggestSource: input.suggestSource ?? null },
+             c.source = coalesce($source, c.source), c.suggest = coalesce($suggest, c.suggest), c.suggestSource = coalesce($suggestSource, c.suggestSource),
+             c.type = coalesce($type, c.type)`,
+        { columnId, field: input.field ?? null, label: input.label ?? null, order: input.order ?? null, source: input.source ?? null, suggest: input.suggest ?? null, suggestSource: input.suggestSource ?? null, type: columnType ?? null },
       );
     } finally {
       await session.close();
     }
+    await writeAudit({ actorId: userId, action: "UPDATE", surfaceId, targetId: columnId, targetLabel: "Column", changes: input });
     return refreshSurfacePayload(surfaceId);
   };
 
@@ -426,6 +509,7 @@ export function getSchema(userId: string) {
     } finally {
       await session.close();
     }
+    await writeAudit({ actorId: userId, action: "DELETE", surfaceId, targetId: columnId, targetLabel: "Column", changes: null });
     return refreshSurfacePayload(surfaceId);
   };
 

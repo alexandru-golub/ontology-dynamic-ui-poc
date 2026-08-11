@@ -7,6 +7,8 @@ import { driver } from "./neo4j";
 // Types
 // ---------------------------------------------------------------------------
 export type Permissions = Record<"view" | "create" | "update" | "delete" | "export" | "manage", boolean>;
+export const COLUMN_TYPES = ["string", "number", "boolean", "date", "money"] as const;
+export type ColumnType = (typeof COLUMN_TYPES)[number];
 export type Column = {
   id: string;
   field: string;
@@ -15,6 +17,7 @@ export type Column = {
   source: string | null;
   suggest: boolean;
   suggestSource: string | null;
+  type: ColumnType;
 };
 export type SurfaceMeta = { id: string; title: string; renderer: string; rootLabel: string; columns: Column[] };
 export type SurfaceRow = { id: string; values: Record<string, unknown> };
@@ -45,7 +48,47 @@ export function sanitizeLabel(label: string): string {
 }
 
 /** Renderers implemented in the frontend; `Surface.renderer` must be one of these. */
-export const RENDERERS = ["table", "cards", "form", "board", "timeline"] as const;
+export const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt"] as const;
+
+export function sanitizeColumnType(type: string | null | undefined, fallback: ColumnType = "string"): ColumnType {
+  const value = (type ?? fallback).toLowerCase();
+  if (!(COLUMN_TYPES as readonly string[]).includes(value)) {
+    throw new GraphQLError(`Invalid column type "${type}". Supported: ${COLUMN_TYPES.join(", ")}.`, {
+      extensions: { code: "BAD_INPUT" },
+    });
+  }
+  return value as ColumnType;
+}
+
+/**
+ * Coerce a raw write value to the column's declared type. Throws a friendly
+ * GraphQL error for unparseable values (e.g. "abc" for a number column).
+ * Dates are normalized to `yyyy-mm-dd` (or full ISO when a time is given).
+ */
+export function coerceValue(type: ColumnType, value: unknown): unknown {
+  if (value === null || value === undefined || value === "") return value;
+  if (type === "string") return String(value);
+  if (type === "number" || type === "money") {
+    const num = typeof value === "number" ? value : Number(String(value).replace(/[$,\s]/g, ""));
+    if (Number.isNaN(num)) throw new GraphQLError(`Invalid ${type} value "${value}"`, { extensions: { code: "BAD_INPUT" } });
+    return type === "money" ? Math.round(num * 100) / 100 : num;
+  }
+  if (type === "boolean") {
+    if (typeof value === "boolean") return value;
+    const text = String(value).trim().toLowerCase();
+    if (["true", "yes", "1", "on"].includes(text)) return true;
+    if (["false", "no", "0", "off"].includes(text)) return false;
+    throw new GraphQLError(`Invalid boolean value "${value}"`, { extensions: { code: "BAD_INPUT" } });
+  }
+  if (type === "date") {
+    const text = String(value).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+    const time = Date.parse(text);
+    if (Number.isNaN(time)) throw new GraphQLError(`Invalid date value "${value}"`, { extensions: { code: "BAD_INPUT" } });
+    return new Date(time).toISOString();
+  }
+  return value;
+}
 
 export function validateRenderer(renderer: string | null | undefined): void {
   if (renderer && !(RENDERERS as readonly string[]).includes(renderer)) {
@@ -126,7 +169,7 @@ RETURN s.id AS id,
        coalesce(s.title, s.name) AS title,
        s.renderer AS renderer,
        coalesce(s.rootLabel, 'Project') AS rootLabel,
-       [c IN collect(column) WHERE c IS NOT NULL | { id: elementId(c), field: c.field, label: c.label, order: toInteger(c.order), source: c.source, suggest: coalesce(c.suggest, false), suggestSource: c.suggestSource }] AS columns`;
+       [c IN collect(column) WHERE c IS NOT NULL | { id: elementId(c), field: c.field, label: c.label, order: toInteger(c.order), source: c.source, suggest: coalesce(c.suggest, false), suggestSource: c.suggestSource, type: coalesce(c.type, 'string') }] AS columns`;
 
 export async function getSurfaceMeta(surfaceId: string): Promise<SurfaceMeta> {
   const session = driver.session({ defaultAccessMode: "READ" });
@@ -142,7 +185,7 @@ export async function getSurfaceMeta(surfaceId: string): Promise<SurfaceMeta> {
     };
     return {
       ...record,
-      columns: record.columns.map((c) => ({ ...c, order: Number(c.order) })),
+      columns: record.columns.map((c) => ({ ...c, order: Number(c.order), type: sanitizeColumnType(c.type) })),
     };
   } finally {
     await session.close();
@@ -154,14 +197,82 @@ export async function getSurfaceMeta(surfaceId: string): Promise<SurfaceMeta> {
  * Each column pulls from its own source (self property, neighbor property,
  * neighbor count), so a single surface can mix data from many node types.
  */
-function buildProjectionQuery(rootLabel: string, columns: Column[], rowId?: string) {
+export type ColumnFilter = { field: string; op: "eq" | "neq" | "contains" | "gt" | "lt"; value: string };
+export type ColumnOrder = { field: string; direction: "ASC" | "DESC" };
+export type ProjectionOpts = { rowId?: string; filters?: ColumnFilter[]; search?: string; orderBy?: ColumnOrder | null };
+
+/** Property names are embedded in backticks, so restrict them to safe identifiers. */
+function sanitizeProp(prop: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(prop)) {
+    throw new GraphQLError(`Invalid property "${prop}"`, { extensions: { code: "BAD_INPUT" } });
+  }
+  return prop;
+}
+
+const NUMERIC = /^-?\d+(\.\d+)?$/;
+
+/**
+ * Build one filter condition for a projected column alias. `value` is the raw
+ * string from the UI; numeric-looking values compare numerically, everything
+ * else as text. An empty value means "blank" for eq/neq.
+ */
+function buildFilterCondition(filter: ColumnFilter, alias: string, params: Record<string, unknown>): string {
+  const value = filter.value ?? "";
+  const key = `f_${alias}`;
+  const blank = `(${alias} IS NULL OR toString(${alias}) = '')`;
+  if (filter.op === "eq") {
+    if (value === "") return blank;
+    if (NUMERIC.test(value.trim())) {
+      params[key] = Number(value.trim());
+      return `${alias} = $${key}`;
+    }
+    params[key] = value;
+    return `toString(${alias}) = $${key}`;
+  }
+  if (filter.op === "neq") {
+    if (value === "") return `NOT (${blank})`;
+    if (NUMERIC.test(value.trim())) {
+      params[key] = Number(value.trim());
+      return `${alias} <> $${key}`;
+    }
+    params[key] = value;
+    return `toString(${alias}) <> $${key}`;
+  }
+  if (filter.op === "contains") {
+    if (value === "") return "true";
+    params[key] = value.toLowerCase();
+    return `toLower(toString(${alias})) CONTAINS $${key}`;
+  }
+  // gt / lt
+  if (value === "") return "true";
+  const symbol = filter.op === "gt" ? ">" : "<";
+  if (NUMERIC.test(value.trim())) {
+    params[key] = Number(value.trim());
+    return `${alias} ${symbol} $${key}`;
+  }
+  params[key] = value;
+  return `toString(${alias}) ${symbol} $${key}`;
+}
+
+/**
+ * Build a projection query for a surface rooted at `rootLabel`.
+ * Each column pulls from its own source (self property, neighbor property,
+ * neighbor count), so a single surface can mix data from many node types.
+ * Every column gets a `vN` alias (self props too) so filters, search and
+ * ordering can be applied server-side over the *projected* values.
+ */
+function buildProjectionQuery(rootLabel: string, columns: Column[], opts: ProjectionOpts = {}) {
   const label = sanitizeLabel(rootLabel);
   const clauses: string[] = [];
-  const returns: string[] = ["elementId(root) AS id", "properties(root) AS rootProps"];
+  const returns: string[] = [];
   const aliases: Record<string, string> = {};
+  const params: Record<string, unknown> = {};
   columns.forEach((column, index) => {
     const source = parseSource(column.source, column.field);
-    if (source.kind === "neighbor") {
+    const alias = `v${index}`;
+    if (source.kind === "self") {
+      returns.push(`root.\`${sanitizeProp(source.prop)}\` AS ${alias}`);
+    } else if (source.kind === "neighbor") {
       const pattern =
         source.rel && source.dir === "in"
           ? `(root)<-[n${index}_r:${source.rel}]-(n${index}:${source.label})`
@@ -169,8 +280,7 @@ function buildProjectionQuery(rootLabel: string, columns: Column[], rowId?: stri
             ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
             : `(root)--(n${index}:${source.label})`;
       clauses.push(`OPTIONAL MATCH ${pattern}`);
-      returns.push(`collect(DISTINCT n${index}.${source.prop})[0] AS v${index}`);
-      aliases[column.field] = `v${index}`;
+      returns.push(`collect(DISTINCT n${index}.${source.prop})[0] AS ${alias}`);
     } else if (source.kind === "count") {
       const pattern =
         source.rel && source.dir === "in"
@@ -179,13 +289,40 @@ function buildProjectionQuery(rootLabel: string, columns: Column[], rowId?: stri
             ? `(root)-[n${index}_r:${source.rel}]->(n${index}:${source.label})`
             : `(root)--(n${index}:${source.label})`;
       clauses.push(`OPTIONAL MATCH ${pattern}`);
-      returns.push(`count(DISTINCT n${index}) AS v${index}`);
-      aliases[column.field] = `v${index}`;
+      returns.push(`count(DISTINCT n${index}) AS ${alias}`);
     }
+    aliases[column.field] = alias;
   });
-  const where = rowId ? "WHERE elementId(root) = $rowId\n" : "";
-  const query = `MATCH (root:\`${label}\`)\n${where}${clauses.join("\n")}\nRETURN ${returns.join(", ")}`;
-  return { query, aliases };
+
+  const whereParts: string[] = [];
+  if (opts.rowId) {
+    whereParts.push("elementId(root) = $rowId");
+    params.rowId = opts.rowId;
+  }
+  for (const filter of opts.filters ?? []) {
+    const alias = aliases[filter.field];
+    if (!alias) {
+      throw new GraphQLError(`Unknown filter field "${filter.field}".`, { extensions: { code: "BAD_INPUT" } });
+    }
+    const condition = buildFilterCondition(filter, alias, params);
+    if (condition !== "true") whereParts.push(condition);
+  }
+  const search = opts.search?.trim();
+  if (search) {
+    params.search = search.toLowerCase();
+    whereParts.push(
+      `(${columns.map((_, index) => `toLower(toString(v${index})) CONTAINS toLower($search)`).join(" OR ")})`,
+    );
+  }
+  const where = whereParts.length ? `WHERE ${whereParts.join("\nAND ")}` : "";
+  const projected = returns.length ? ", " + returns.join(", ") : "";
+  // The WITH introduces id/rootProps/vN aliases; the RETURN may only reference
+  // those aliases (aggregates like collect() are no longer in scope after the
+  // WITH, and re-evaluating them would also re-run the OPTIONAL MATCHes).
+  const returnAliases = columns.length ? ", " + columns.map((_, index) => `v${index}`).join(", ") : "";
+  const core = `MATCH (root:\`${label}\`)\n${clauses.join("\n")}\nWITH root, elementId(root) AS id, properties(root) AS rootProps${projected}\n${where}`;
+  const query = `${core}\nRETURN id, rootProps${returnAliases}`;
+  return { query, core, aliases, params };
 }
 
 function assembleRows(records: unknown[], columns: Column[], aliases: Record<string, string>): SurfaceRow[] {
@@ -203,11 +340,9 @@ function assembleRows(records: unknown[], columns: Column[], aliases: Record<str
 }
 
 export async function runSurfaceRows(surface: SurfaceMeta, rowId?: string): Promise<SurfaceRow[]> {
-  const { query, aliases } = buildProjectionQuery(surface.rootLabel, surface.columns, rowId);
+  const { query, aliases, params } = buildProjectionQuery(surface.rootLabel, surface.columns, { rowId });
   const session = driver.session({ defaultAccessMode: "READ" });
   try {
-    const params: Record<string, unknown> = {};
-    if (rowId) params.rowId = rowId;
     const result = await session.run(query, params);
     return assembleRows(result.records, surface.columns, aliases);
   } finally {
@@ -301,7 +436,8 @@ const LEGACY_LINKS: Record<string, { rel: string; dir: "in" | "out" }> = {
  * Route an incoming `values` map onto root properties and typed-relationship
  * neighbors. Neighbors are keyed by column field so mutation responses can be
  * assembled per column. Untyped (`Label.prop`) sources fall back to the legacy
- * link map; unknown labels are read-only (no write).
+ * link map; unknown labels are read-only (no write). Self-property values are
+ * coerced to the column's declared type (number/boolean/date/money/string).
  */
 function routeValues(columns: Column[], values: Record<string, unknown>) {
   const props: Record<string, unknown> = {};
@@ -312,7 +448,7 @@ function routeValues(columns: Column[], values: Record<string, unknown>) {
     const text = typeof raw === "string" ? raw.trim() : String(raw);
     const source = parseSource(column.source, column.field);
     if (source.kind === "self") {
-      props[source.prop] = toPlain(raw);
+      props[source.prop] = coerceValue(column.type ?? "string", toPlain(raw));
     } else if (source.kind === "neighbor") {
       let rel = source.rel;
       let dir = source.dir;
@@ -365,7 +501,40 @@ function writableLinkKinds(surface: SurfaceMeta): Array<{ rel: string; dir: "in"
   return [...kinds.values()];
 }
 
-export async function createRow(surfaceId: string, values: Record<string, unknown>): Promise<SurfaceRow> {
+type AuditInput = {
+  actorId: string;
+  action: "CREATE" | "UPDATE" | "DELETE";
+  surfaceId: string;
+  surfaceTitle?: string | null;
+  targetId?: string | null;
+  targetLabel?: string | null;
+  changes?: unknown;
+};
+
+/** Shared Cypher tail: create an AuditEvent node and link the actor to it. */
+function auditTail(): string {
+  return `
+CREATE (a:AuditEvent {id: $auditId, action: $auditAction, actorId: $actorId, surfaceId: $surfaceId, surfaceTitle: $surfaceTitle, targetId: $targetId, targetLabel: $targetLabel, changes: $changes, at: toString(datetime())})
+WITH a, root
+OPTIONAL MATCH (u:User {id: $actorId})
+SET a.actorName = coalesce(u.name, $actorId)
+FOREACH (_ IN CASE WHEN u IS NULL THEN [] ELSE [1] END | CREATE (u)-[:PERFORMED]->(a))`;
+}
+
+function auditParams(audit: AuditInput, surface: SurfaceMeta): Record<string, unknown> {
+  return {
+    auditId: `audit_${randomUUID()}`,
+    auditAction: audit.action,
+    actorId: audit.actorId,
+    surfaceId: audit.surfaceId,
+    surfaceTitle: audit.surfaceTitle ?? surface.title,
+    targetId: audit.targetId ?? null,
+    targetLabel: audit.targetLabel ?? "Row",
+    changes: audit.changes === undefined ? null : JSON.stringify(audit.changes),
+  };
+}
+
+export async function createRow(surfaceId: string, values: Record<string, unknown>, actorId: string): Promise<SurfaceRow> {
   const surface = await getSurfaceMeta(surfaceId);
   const { props, neighbors } = routeValues(surface.columns, values);
   const label = sanitizeLabel(surface.rootLabel);
@@ -374,13 +543,20 @@ export async function createRow(surfaceId: string, values: Record<string, unknow
   const linkParts = specs.map((spec, i) =>
     spec.dir === "in" ? `CREATE (n_${i})-[:${spec.rel}]->(root)` : `CREATE (root)-[:${spec.rel}]->(n_${i})`,
   );
+  const written: Record<string, unknown> = { ...props };
+  for (const [field, spec] of Object.entries(neighbors)) written[field] = spec.name;
   const query = `
 CREATE (root:\`${label}\` {id: $rowId})
 SET root += $props
 ${mergeParts.join("\n")}
 ${linkParts.join("\n")}
+${auditTail()}
 RETURN elementId(root) AS id, properties(root) AS rootProps`;
-  const params: Record<string, unknown> = { rowId: `row_${randomUUID()}`, props };
+  const params: Record<string, unknown> = {
+    rowId: `row_${randomUUID()}`,
+    props,
+    ...auditParams({ actorId, action: "CREATE", surfaceId, changes: written }, surface),
+  };
   specs.forEach((spec, i) => {
     params[`prop_${i}`] = spec.name;
   });
@@ -394,7 +570,12 @@ RETURN elementId(root) AS id, properties(root) AS rootProps`;
   }
 }
 
-export async function updateRow(surfaceId: string, rowId: string, values: Record<string, unknown>): Promise<SurfaceRow> {
+export async function updateRow(
+  surfaceId: string,
+  rowId: string,
+  values: Record<string, unknown>,
+  actorId: string,
+): Promise<SurfaceRow> {
   const surface = await getSurfaceMeta(surfaceId);
   const current = (await runSurfaceRows(surface, rowId))[0];
   if (!current) throw new GraphQLError("Row not found", { extensions: { code: "NOT_FOUND" } });
@@ -405,6 +586,15 @@ export async function updateRow(surfaceId: string, rowId: string, values: Record
   specs.forEach((spec, i) => {
     params[`prop_${i}`] = spec.name;
   });
+
+  const diff: Record<string, { from: unknown; to: unknown }> = {};
+  for (const column of surface.columns) {
+    const before = current.values[column.field];
+    const after = merged[column.field];
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      diff[column.field] = { from: before ?? null, to: after ?? null };
+    }
+  }
 
   // Three statements, each individually valid Cypher (a MATCH may not follow a
   // SET/CREATE/DELETE/MERGE updating clause without an intervening WITH).
@@ -427,31 +617,69 @@ ${specs.map((spec, i) => `MERGE (n_${i}:${spec.label} {${spec.prop}: $prop_${i}}
 ${specs
   .map((spec, i) => (spec.dir === "in" ? `CREATE (n_${i})-[:${spec.rel}]->(root)` : `CREATE (root)-[:${spec.rel}]->(n_${i})`))
   .join("\n")}
+${auditTail()}
 RETURN elementId(root) AS id, properties(root) AS rootProps`;
 
   const session = driver.session({ defaultAccessMode: "WRITE" });
+  const tx = session.beginTransaction();
   try {
-    await session.run(deleteRels, params);
-    await session.run(setProps, params);
-    const result = await session.run(relink, params);
+    // All three statements (detach, set props, relink + audit) run inside one
+    // transaction: a failure in any of them rolls back the whole update.
+    await tx.run(deleteRels, params);
+    await tx.run(setProps, params);
+    const result = await tx.run(relink, {
+      ...params,
+      ...auditParams({ actorId, action: "UPDATE", surfaceId, targetId: rowId, changes: diff }, surface),
+    });
     const obj = result.records[0].toObject() as { id: string; rootProps: Record<string, unknown> };
+    await tx.commit();
     return { id: String(obj.id), values: valuesFromWrite(surface, obj.rootProps, neighbors) };
+  } catch (error) {
+    await tx.rollback();
+    throw error;
   } finally {
     await session.close();
   }
 }
 
-export async function deleteRows(ids: string[]): Promise<number> {
+export async function deleteRows(surfaceId: string, ids: string[], actorId: string): Promise<number> {
+  const surface = await getSurfaceMeta(surfaceId);
   const session = driver.session({ defaultAccessMode: "WRITE" });
   try {
+    // Capture the rows' last-known state first (they are gone after the delete).
+    const capture = await session.run(
+      `MATCH (n) WHERE elementId(n) IN $ids RETURN elementId(n) AS id, properties(n) AS props`,
+      { ids },
+    );
+    const auditRows = capture.records.map((record) => {
+      const obj = record.toObject();
+      return {
+        auditId: `audit_${randomUUID()}`,
+        targetId: String(obj.id),
+        changes: JSON.stringify(toPlain(obj.props)),
+      };
+    });
+    if (auditRows.length > 0) {
+      await session.run(
+        `
+UNWIND $auditRows AS row
+CREATE (a:AuditEvent {id: row.auditId, action: $auditAction, actorId: $actorId, surfaceId: $surfaceId, surfaceTitle: $surfaceTitle, targetId: row.targetId, targetLabel: $targetLabel, changes: row.changes, at: toString(datetime())})
+WITH a
+OPTIONAL MATCH (u:User {id: $actorId})
+SET a.actorName = coalesce(u.name, $actorId)
+FOREACH (_ IN CASE WHEN u IS NULL THEN [] ELSE [1] END | CREATE (u)-[:PERFORMED]->(a))`,
+        {
+          auditRows,
+          auditAction: "DELETE",
+          actorId,
+          surfaceId,
+          surfaceTitle: surface.title,
+          targetLabel: "Row",
+        },
+      );
+    }
     const result = await session.run(
-      `
-MATCH (n) WHERE elementId(n) IN $ids
-WITH collect(n) AS nodes
-WITH nodes, size(nodes) AS cnt
-UNWIND nodes AS n
-DETACH DELETE n
-RETURN cnt`,
+      `MATCH (n) WHERE elementId(n) IN $ids DETACH DELETE n RETURN count(n) AS cnt`,
       { ids },
     );
     return result.records[0].get("cnt").toNumber();
@@ -460,22 +688,133 @@ RETURN cnt`,
   }
 }
 
+/**
+ * Write an AuditEvent in its own transaction (used for surface/column
+ * definition changes, where the mutation itself lives in the resolver).
+ */
+export async function writeAudit(audit: AuditInput): Promise<void> {
+  const session = driver.session({ defaultAccessMode: "WRITE" });
+  try {
+    await session.run(
+      `
+CREATE (a:AuditEvent {id: $auditId, action: $auditAction, actorId: $actorId, surfaceId: $surfaceId, surfaceTitle: $surfaceTitle, targetId: $targetId, targetLabel: $targetLabel, changes: $changes, at: toString(datetime())})
+WITH a
+OPTIONAL MATCH (u:User {id: $actorId})
+SET a.actorName = coalesce(u.name, $actorId)
+FOREACH (_ IN CASE WHEN u IS NULL THEN [] ELSE [1] END | CREATE (u)-[:PERFORMED]->(a))`,
+      {
+        auditId: `audit_${randomUUID()}`,
+        auditAction: audit.action,
+        actorId: audit.actorId,
+        surfaceId: audit.surfaceId ?? null,
+        surfaceTitle: audit.surfaceTitle ?? null,
+        targetId: audit.targetId ?? null,
+        targetLabel: audit.targetLabel ?? null,
+        changes: audit.changes === undefined ? null : JSON.stringify(audit.changes),
+      },
+    );
+  } finally {
+    await session.close();
+  }
+}
+
+export type AuditEvent = {
+  id: string;
+  at: string;
+  actorId: string;
+  actorName: string;
+  action: string;
+  surfaceId: string | null;
+  surfaceTitle: string | null;
+  targetId: string | null;
+  targetLabel: string | null;
+  changes: unknown;
+};
+
+export type AuditPage = {
+  edges: Array<{ cursor: string; node: AuditEvent }>;
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  totalCount: number;
+};
+
+/** Offset-paged audit trail, newest first. */
+export async function auditEventsPage(first = 50, after?: string): Promise<AuditPage> {
+  const limit = Math.min(Math.max(first, 1), 500);
+  const skip = after ? parseInt(Buffer.from(after, "base64url").toString("utf8").replace("offset:", ""), 10) || 0 : 0;
+  const session = driver.session({ defaultAccessMode: "READ" });
+  try {
+    const countResult = await session.run(`MATCH (a:AuditEvent) RETURN count(a) AS c`);
+    const totalCount = countResult.records[0].get("c").toNumber();
+    const result = await session.run(
+      `MATCH (a:AuditEvent)
+       RETURN a.id AS id, a.at AS at, a.actorId AS actorId, a.actorName AS actorName, a.action AS action,
+              a.surfaceId AS surfaceId, a.surfaceTitle AS surfaceTitle, a.targetId AS targetId, a.targetLabel AS targetLabel, a.changes AS changes
+       ORDER BY a.at DESC, elementId(a) DESC
+       SKIP toInteger($skip) LIMIT toInteger($limit)`,
+      { skip, limit },
+    );
+    const nodes = result.records.map((record) => {
+      const obj = record.toObject();
+      return {
+        id: String(obj.id),
+        at: String(obj.at ?? ""),
+        actorId: String(obj.actorId ?? ""),
+        actorName: String(obj.actorName ?? obj.actorId ?? ""),
+        action: String(obj.action ?? ""),
+        surfaceId: obj.surfaceId ? String(obj.surfaceId) : null,
+        surfaceTitle: obj.surfaceTitle ? String(obj.surfaceTitle) : null,
+        targetId: obj.targetId ? String(obj.targetId) : null,
+        targetLabel: obj.targetLabel ? String(obj.targetLabel) : null,
+        changes:
+          obj.changes === undefined || obj.changes === null
+            ? null
+            : typeof obj.changes === "string"
+              ? JSON.parse(obj.changes)
+              : toPlain(obj.changes),
+      };
+    });
+    const edges = nodes.map((node, i) => ({ cursor: Buffer.from(`offset:${skip + i}`).toString("base64url"), node }));
+    const endCursor = edges.length ? Buffer.from(`offset:${skip + edges.length}`).toString("base64url") : null;
+    return { edges, pageInfo: { hasNextPage: skip + nodes.length < totalCount, endCursor }, totalCount };
+  } finally {
+    await session.close();
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Paged row connection (cursor = base64 offset; ordered by elementId)
+// Paged row connection (cursor = base64 offset)
+// Filters / search / orderBy apply server-side over the projected values, so
+// the cursor (offset) always refers to the *filtered, ordered* result set.
 // ---------------------------------------------------------------------------
+export type RowPage = {
+  edges: Array<{ cursor: string; node: SurfaceRow }>;
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  totalCount: number;
+};
+
 export async function surfaceRowsPage(
   surface: SurfaceMeta,
   first = 50,
   after?: string,
-): Promise<{ edges: Array<{ cursor: string; node: SurfaceRow }>; pageInfo: { hasNextPage: boolean; endCursor: string | null }; totalCount: number }> {
+  opts: { filters?: ColumnFilter[]; search?: string; orderBy?: ColumnOrder | null } = {},
+): Promise<RowPage> {
   const limit = Math.min(Math.max(first, 1), 500);
   const skip = after ? parseInt(Buffer.from(after, "base64url").toString("utf8").replace("offset:", ""), 10) || 0 : 0;
-  const { query, aliases } = buildProjectionQuery(surface.rootLabel, surface.columns);
+  const { query, core, aliases, params } = buildProjectionQuery(surface.rootLabel, surface.columns, opts);
+  const orderClause = (() => {
+    if (!opts.orderBy) return "ORDER BY elementId(root)";
+    const alias = aliases[opts.orderBy.field];
+    if (!alias) {
+      throw new GraphQLError(`Unknown orderBy field "${opts.orderBy.field}".`, { extensions: { code: "BAD_INPUT" } });
+    }
+    // Nulls sort last in both directions, then by elementId for a stable cursor.
+    return `ORDER BY ${alias} IS NULL, ${alias} ${opts.orderBy.direction}, elementId(root)`;
+  })();
   const session = driver.session({ defaultAccessMode: "READ" });
   try {
-    const countResult = await session.run(`MATCH (root:\`${sanitizeLabel(surface.rootLabel)}\`) RETURN count(root) AS c`);
+    const countResult = await session.run(`${core}\nRETURN count(root) AS c`, params);
     const totalCount = countResult.records[0].get("c").toNumber();
-    const pageResult = await session.run(`${query}\nORDER BY elementId(root) SKIP toInteger($skip) LIMIT toInteger($limit)`, { skip, limit });
+    const pageResult = await session.run(`${query}\n${orderClause} SKIP toInteger($skip) LIMIT toInteger($limit)`, { ...params, skip, limit });
     const rows = assembleRows(pageResult.records, surface.columns, aliases);
     const edges = rows.map((node, i) => ({ cursor: Buffer.from(`offset:${skip + i}`).toString("base64url"), node }));
     // The end cursor points one past the last returned row, so the next page

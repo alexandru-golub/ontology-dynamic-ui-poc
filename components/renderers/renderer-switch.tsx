@@ -5,6 +5,8 @@ import { BoardRenderer } from "./board-renderer";
 import { CardsRenderer } from "./cards-renderer";
 import { DataTableRenderer } from "./table-renderer";
 import { FormRenderer } from "./form-renderer";
+import { GanttRenderer } from "./gantt-renderer";
+import { PivotRenderer } from "./pivot-renderer";
 import { TimelineRenderer } from "./timeline-renderer";
 import type { RendererProps } from "./types";
 
@@ -19,6 +21,10 @@ export function RendererSwitch({ renderer, ...props }: RendererProps & { rendere
       return <BoardRenderer {...props} />;
     case "timeline":
       return <TimelineRenderer {...props} />;
+    case "pivot":
+      return <PivotRenderer {...props} />;
+    case "gantt":
+      return <GanttRenderer {...props} />;
     case "table":
       return <DataTableRenderer {...props} />;
     default:

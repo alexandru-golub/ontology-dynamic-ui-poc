@@ -1,11 +1,12 @@
 "use client";
 
 import { gql, useApolloClient, useMutation, useQuery } from "@apollo/client";
-import { ChevronDown, ChevronUp, Download, GripVertical, Plus, Settings2, Trash2, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Download, Filter, GripVertical, Plus, Search, Settings2, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { TableColumn, TableRowData } from "@/components/data-table";
 import { RendererSwitch } from "@/components/renderers/renderer-switch";
 import { SuggestInput } from "@/components/suggest-input";
+import { TypedInput } from "@/components/typed-input";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -45,6 +46,7 @@ const GET_SURFACE = gql`
         source
         suggest
         suggestSource
+        type
       }
       permissions {
         view
@@ -63,8 +65,8 @@ const GET_SURFACE = gql`
 `;
 
 const SURFACE_ROWS = gql`
-  query SurfaceRows($surfaceId: ID!, $first: Int, $after: String) {
-    surfaceRows(surfaceId: $surfaceId, first: $first, after: $after) {
+  query SurfaceRows($surfaceId: ID!, $first: Int, $after: String, $search: String, $filters: [ColumnFilterInput!], $orderBy: ColumnOrderInput) {
+    surfaceRows(surfaceId: $surfaceId, first: $first, after: $after, search: $search, filters: $filters, orderBy: $orderBy) {
       totalCount
       pageInfo {
         hasNextPage
@@ -139,7 +141,7 @@ const UPDATE_COLUMN = gql`
   }
 `;
 
-const RENDERERS = ["table", "cards", "form", "board", "timeline"];
+const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt"];
 const PAGE_SIZE = 50;
 
 type SurfaceRowsData = {
@@ -170,6 +172,9 @@ type SurfacePayload = {
   permissions: Permissions;
   suggestions: Array<{ field: string; values: string[] }>;
 };
+
+export type ColumnFilterState = { field: string; op: "eq" | "neq" | "contains" | "gt" | "lt"; value: string };
+type ColumnOrderState = { field: string; direction: "ASC" | "DESC" } | null;
 type RowPage = {
   rows: TableRowData[];
   hasNextPage: boolean;
@@ -220,13 +225,41 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
   const [rowPage, setRowPage] = useState<RowPage>({ rows: [], hasNextPage: false, endCursor: null, totalCount: 0 });
   const [rowsLoading, setRowsLoading] = useState(true);
 
+  // ---- server-side search / filters / sort ----
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [filters, setFilters] = useState<ColumnFilterState[]>([]);
+  const [orderBy, setOrderBy] = useState<ColumnOrderState>(null);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [filterDraft, setFilterDraft] = useState<ColumnFilterState[]>([]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  useEffect(() => {
+    if (filterOpen) setFilterDraft(filters);
+  }, [filterOpen, filters]);
+
+  const rowVariables = useCallback(
+    (after?: string | null) => ({
+      surfaceId,
+      after: after ?? undefined,
+      search: debouncedSearch.trim() || undefined,
+      filters: filters.length ? filters : undefined,
+      orderBy: orderBy ?? undefined,
+    }),
+    [surfaceId, debouncedSearch, filters, orderBy],
+  );
+
   const loadPage = useCallback(
     async (after?: string | null, append = false) => {
       setRowsLoading(true);
       try {
         const { data } = await client.query<SurfaceRowsData>({
           query: SURFACE_ROWS,
-          variables: { surfaceId, first: PAGE_SIZE, after: after ?? undefined },
+          variables: { first: PAGE_SIZE, ...rowVariables(after) },
           fetchPolicy: "no-cache",
         });
         const conn = data.surfaceRows;
@@ -242,9 +275,10 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
         setRowsLoading(false);
       }
     },
-    [client, surfaceId],
+    [client, rowVariables],
   );
 
+  // Any change to search/filters/order resets the cursor to the first page.
   useEffect(() => {
     void loadPage(null);
   }, [loadPage]);
@@ -256,7 +290,7 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
     do {
       const result = await client.query<SurfaceRowsData>({
         query: SURFACE_ROWS,
-        variables: { surfaceId, first: 500, after: after ?? undefined },
+        variables: { first: 500, ...rowVariables(after) },
         fetchPolicy: "no-cache",
       });
       const conn: SurfaceRowsData["surfaceRows"] = result.data.surfaceRows;
@@ -264,7 +298,7 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
       after = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
     } while (after);
     return all;
-  }, [client, surfaceId]);
+  }, [client, rowVariables]);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState<string | null>(null);
@@ -274,7 +308,7 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
   const [titleDraft, setTitleDraft] = useState("");
   const [rootDraft, setRootDraft] = useState("");
   const [rendererDraft, setRendererDraft] = useState("table");
-  const [columnDraft, setColumnDraft] = useState({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "" });
+  const [columnDraft, setColumnDraft] = useState({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "", type: "string" });
   // column reorder state (manage dialog)
   const [columnsDraft, setColumnsDraft] = useState<TableColumn[] | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
@@ -385,10 +419,11 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
             order: columnDraft.order ? Number(columnDraft.order) : null,
             suggest: columnDraft.suggest,
             suggestSource: columnDraft.suggestSource.trim() || undefined,
+            type: columnDraft.type,
           },
         },
       });
-      setColumnDraft({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "" });
+      setColumnDraft({ field: "", label: "", source: "", order: "", suggest: false, suggestSource: "", type: "string" });
       setNotice(`Column "${columnDraft.field}" added.`);
       await refetch();
     } catch (err) {
@@ -480,6 +515,9 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
     hasNextPage: rowPage.hasNextPage,
     totalCount: rowPage.totalCount,
     onLoadMore: () => void loadPage(rowPage.endCursor, true),
+    sort: orderBy ? { field: orderBy.field, dir: orderBy.direction === "ASC" ? ("asc" as const) : ("desc" as const) } : null,
+    onSortChange: (next: { field: string; dir: "asc" | "desc" } | null) =>
+      setOrderBy(next ? { field: next.field, direction: next.dir === "asc" ? "ASC" : "DESC" } : null),
   };
 
   return (
@@ -489,7 +527,19 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
           root: {surface.rootLabel}
         </Badge>
         <Badge variant="outline">{surface.renderer}</Badge>
-        <div className="flex-1" />
+        <div className="relative ml-auto w-56">
+          <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+          <Input
+            className="h-8 pl-8 text-sm"
+            placeholder="Search rows…"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            aria-label="Search rows"
+          />
+        </div>
+        <Button size="sm" variant="outline" className="h-8" onClick={() => setFilterOpen(true)}>
+          <Filter /> Filters{filters.length > 0 ? ` (${filters.length})` : ""}
+        </Button>
         {permissions.create && (
           <Button size="sm" onClick={openCreateDialog}>
             <Plus /> Add row
@@ -562,21 +612,14 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                       {column.suggest ? " · suggest" : ""}
                     </span>
                   </Label>
-                  {suggestions[column.field] ? (
-                    <SuggestInput
-                      id={`create-${column.field}`}
-                      value={createValues[column.field] ?? ""}
-                      onChange={(v) => setCreateValues((prev) => ({ ...prev, [column.field]: v }))}
-                      onCommit={() => undefined}
-                      suggestions={suggestions[column.field]}
-                    />
-                  ) : (
-                    <Input
-                      id={`create-${column.field}`}
-                      value={createValues[column.field] ?? ""}
-                      onChange={(event) => setCreateValues((prev) => ({ ...prev, [column.field]: event.target.value }))}
-                    />
-                  )}
+                  <TypedInput
+                    id={`create-${column.field}`}
+                    type={column.type}
+                    value={createValues[column.field] ?? ""}
+                    onChange={(v) => setCreateValues((prev) => ({ ...prev, [column.field]: v }))}
+                    onCommit={() => undefined}
+                    suggestions={suggestions[column.field]}
+                  />
                 </div>
               ))}
           </div>
@@ -587,6 +630,91 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
             <Button onClick={() => void submitCreate()} disabled={!createValues.project?.trim() && surface.rootLabel === "Project"}>
               Create
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+
+      {/* ---------------- Filters dialog ---------------- */}
+      <Dialog open={filterOpen} onOpenChange={setFilterOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Filter rows</DialogTitle>
+            <DialogDescription>
+              Filters run server-side inside the row connection — the count, paging and CSV
+              export all apply to the filtered set. Empty value matches blank cells.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3">
+            {filterDraft.map((filter, index) => (
+              <div key={index} className="grid grid-cols-[1fr_110px_1fr_32px] items-center gap-2">
+                <Select
+                  value={filter.field}
+                  onValueChange={(field) => setFilterDraft((prev) => prev.map((f, i) => (i === index ? { ...f, field } : f)))}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {[...surface.columns].sort((a, b) => a.order - b.order).map((column) => (
+                      <SelectItem key={column.field} value={column.field}>{column.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={filter.op}
+                  onValueChange={(op) => setFilterDraft((prev) => prev.map((f, i) => (i === index ? { ...f, op: op as ColumnFilterState["op"] } : f)))}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="eq">is</SelectItem>
+                    <SelectItem value="neq">is not</SelectItem>
+                    <SelectItem value="contains">contains</SelectItem>
+                    <SelectItem value="gt">&gt;</SelectItem>
+                    <SelectItem value="lt">&lt;</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Input
+                  placeholder="value"
+                  value={filter.value}
+                  onChange={(event) => setFilterDraft((prev) => prev.map((f, i) => (i === index ? { ...f, value: event.target.value } : f)))}
+                />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="text-muted-foreground hover:text-destructive"
+                  onClick={() => setFilterDraft((prev) => prev.filter((_, i) => i !== index))}
+                  aria-label="Remove filter"
+                >
+                  <X />
+                </Button>
+              </div>
+            ))}
+            {filterDraft.length === 0 && <p className="text-sm text-muted-foreground">No filters — showing every row.</p>}
+            <Button size="sm" variant="outline" onClick={() => setFilterDraft((prev) => [...prev, { field: surface.columns[0]?.field ?? "", op: "eq", value: "" }])}>
+              <Plus /> Add filter
+            </Button>
+          </div>
+          <DialogFooter className="justify-between">
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setFilters([]);
+                setFilterDraft([]);
+                setFilterOpen(false);
+              }}
+            >
+              Clear all
+            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setFilterOpen(false)}>Cancel</Button>
+              <Button
+                onClick={() => {
+                  setFilters(filterDraft.filter((f) => f.field));
+                  setFilterOpen(false);
+                }}
+              >
+                Apply
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -703,7 +831,7 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
 
             <div className="grid gap-1.5">
               <Label className="mb-1 block">Add column</Label>
-              <div className="grid grid-cols-[1fr_1fr_1fr_1fr_64px] gap-2">
+              <div className="grid grid-cols-[1fr_1fr_1.2fr_0.8fr_64px_110px] gap-2">
                 <Input placeholder="field" value={columnDraft.field} onChange={(e) => setColumnDraft((p) => ({ ...p, field: e.target.value }))} />
                 <Input placeholder="label" value={columnDraft.label} onChange={(e) => setColumnDraft((p) => ({ ...p, label: e.target.value }))} />
                 <Input
@@ -717,6 +845,14 @@ export function DynamicSurface({ surfaceId }: { surfaceId: string }) {
                   onChange={(e) => setColumnDraft((p) => ({ ...p, suggestSource: e.target.value }))}
                 />
                 <Input placeholder="#" type="number" value={columnDraft.order} onChange={(e) => setColumnDraft((p) => ({ ...p, order: e.target.value }))} />
+                <Select value={columnDraft.type} onValueChange={(v) => setColumnDraft((p) => ({ ...p, type: v }))}>
+                  <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {["string", "number", "boolean", "date", "money"].map((t) => (
+                      <SelectItem key={t} value={t}>{t}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
                 <input

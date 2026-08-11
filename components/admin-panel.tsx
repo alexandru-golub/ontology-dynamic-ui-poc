@@ -1,8 +1,8 @@
 "use client";
 
-import { gql, useMutation, useQuery } from "@apollo/client";
+import { gql, useApolloClient, useMutation, useQuery } from "@apollo/client";
 import { Plus, Shield, Trash2, UserCog } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -187,16 +187,55 @@ const PURGE_SURFACE = gql`
   }
 `;
 
+const AUDIT_EVENTS = gql`
+  query AuditEvents($first: Int, $after: String) {
+    auditEvents(first: $first, after: $after) {
+      totalCount
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      edges {
+        cursor
+        node {
+          id
+          at
+          actorId
+          actorName
+          action
+          surfaceId
+          surfaceTitle
+          targetId
+          targetLabel
+          changes
+        }
+      }
+    }
+  }
+`;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+type AuditEvent = {
+  id: string;
+  at: string;
+  actorId: string;
+  actorName: string;
+  action: string;
+  surfaceId: string | null;
+  surfaceTitle: string | null;
+  targetId: string | null;
+  targetLabel: string | null;
+  changes: unknown;
+};
 type Permissions = { view: boolean; create: boolean; update: boolean; delete: boolean; export: boolean; manage: boolean };
 type AdminUser = { id: string; name: string; isAdmin: boolean; roles: string[] };
 type RoleGrant = { surfaceId: string; surfaceTitle: string; permissions: Permissions };
 type RoleInfo = { id: string; name: string; grants: RoleGrant[] };
 type AdminSurface = { id: string; title: string; renderer: string; rootLabel: string; columnCount: number; deleted: boolean };
 
-const RENDERERS = ["table", "cards", "form", "board", "timeline"];
+const RENDERERS = ["table", "cards", "form", "board", "timeline", "pivot", "gantt"];
 
 const PERMISSION_LABELS: Array<[keyof Permissions, string]> = [
   ["view", "View"],
@@ -272,8 +311,37 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
   const [newSurfaceOpen, setNewSurfaceOpen] = useState(false);
   const [newSurface, setNewSurface] = useState({ id: "", title: "", rootLabel: "Project", renderer: "table", columns: "" });
 
+  // ---- audit trail (paged, newest first) ----
+  const client = useApolloClient();
+  const [audit, setAudit] = useState<{ events: AuditEvent[]; hasNextPage: boolean; endCursor: string | null; totalCount: number }>({
+    events: [],
+    hasNextPage: false,
+    endCursor: null,
+    totalCount: 0,
+  });
+  const loadAudit = useCallback(async (after?: string | null, append = false) => {
+    const { data } = await client.query<{
+      auditEvents: {
+        totalCount: number;
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+        edges: Array<{ node: AuditEvent }>;
+      };
+    }>({ query: AUDIT_EVENTS, variables: { first: 50, after: after ?? undefined }, fetchPolicy: "no-cache" });
+    const conn = data.auditEvents;
+    setAudit((prev) => ({
+      events: append ? [...prev.events, ...conn.edges.map((e) => e.node)] : conn.edges.map((e) => e.node),
+      hasNextPage: conn.pageInfo.hasNextPage,
+      endCursor: conn.pageInfo.endCursor,
+      totalCount: conn.totalCount,
+    }));
+  }, [client]);
+
+  useEffect(() => {
+    void loadAudit(null);
+  }, [loadAudit]);
+
   const refetchAll = async () => {
-    await Promise.all([usersQuery.refetch(), rolesQuery.refetch(), surfacesQuery.refetch()]);
+    await Promise.all([usersQuery.refetch(), rolesQuery.refetch(), surfacesQuery.refetch(), loadAudit(null)]);
   };
 
   const run = async (fn: () => Promise<unknown>, ok: string) => {
@@ -342,14 +410,15 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line) => {
-        // field|label|source|order|suggest(yes/no)
-        const [field, label, source, order, suggest] = line.split("|").map((s) => s?.trim());
+        // field|label|source|order|suggest(yes/no)|type
+        const [field, label, source, order, suggest, type] = line.split("|").map((s) => s?.trim());
         return {
           field,
           label,
           source: source || undefined,
           order: order ? Number(order) : undefined,
           suggest: ["yes", "1", "true"].includes((suggest ?? "").toLowerCase()),
+          type: type || undefined,
         };
       })
       .filter((c) => c.field && c.label);
@@ -396,6 +465,7 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
             <TabsTrigger value="users">Users</TabsTrigger>
             <TabsTrigger value="roles">Roles</TabsTrigger>
             <TabsTrigger value="surfaces">Surfaces</TabsTrigger>
+            <TabsTrigger value="audit">Audit</TabsTrigger>
           </TabsList>
           <Button size="sm" onClick={() => setNewUserOpen(true)}>
             <Plus /> New user
@@ -587,6 +657,74 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
                 ))}
               </TableBody>
             </Table>
+          </div>
+        </TabsContent>
+
+        {/* ---------------- Audit ---------------- */}
+        <TabsContent value="audit">
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              {audit.totalCount} event{audit.totalCount === 1 ? "" : "s"} — who changed which row/surface/column and when.
+            </p>
+            <Button size="sm" variant="outline" onClick={() => void loadAudit(null)}>Refresh</Button>
+          </div>
+          <div className="rounded-lg border bg-card">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-44">When</TableHead>
+                  <TableHead className="w-36">Who</TableHead>
+                  <TableHead className="w-24">Action</TableHead>
+                  <TableHead>Surface</TableHead>
+                  <TableHead className="w-24">Target</TableHead>
+                  <TableHead>Changes</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {audit.events.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">
+                      No audit events yet — mutations on rows/surfaces/columns are logged here.
+                    </TableCell>
+                  </TableRow>
+                )}
+                {audit.events.map((event) => (
+                  <TableRow key={event.id}>
+                    <TableCell className="font-mono text-[11px] text-muted-foreground">
+                      {new Date(event.at).toLocaleString()}
+                    </TableCell>
+                    <TableCell>
+                      <span className="font-medium">{event.actorName}</span>
+                      <span className="ml-1 font-mono text-[10px] text-muted-foreground">{event.actorId}</span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={event.action === "DELETE" ? "destructive" : event.action === "CREATE" ? "success" : "secondary"}>
+                        {event.action}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-sm">{event.surfaceTitle ?? event.surfaceId ?? "—"}</TableCell>
+                    <TableCell>
+                      <span className="font-mono text-[10px] text-muted-foreground">{event.targetLabel ?? ""}</span>
+                    </TableCell>
+                    <TableCell className="max-w-md">
+                      <code className="block truncate font-mono text-[10px] text-muted-foreground" title={JSON.stringify(event.changes)}>
+                        {JSON.stringify(event.changes)?.slice(0, 160) || "—"}
+                      </code>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              Showing {audit.events.length} of {audit.totalCount}
+            </span>
+            {audit.hasNextPage && (
+              <Button size="sm" variant="outline" onClick={() => void loadAudit(audit.endCursor, true)}>
+                Load more
+              </Button>
+            )}
           </div>
         </TabsContent>
       </Tabs>

@@ -1,19 +1,28 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, Search } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { SuggestInput } from "@/components/suggest-input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { TypedInput } from "@/components/typed-input";
 import { cn } from "@/lib/utils";
 
-export type TableColumn = { id?: string; field: string; label: string; order: number; source?: string | null; suggest?: boolean; suggestSource?: string | null };
+export type ColumnType = "string" | "number" | "boolean" | "date" | "money";
+export type TableColumn = {
+  id?: string;
+  field: string;
+  label: string;
+  order: number;
+  source?: string | null;
+  suggest?: boolean;
+  suggestSource?: string | null;
+  type?: ColumnType;
+};
 export type TableRowData = { id: string; values: Record<string, unknown> };
 
-type SortState = { field: string; dir: "asc" | "desc" } | null;
+export type SortState = { field: string; dir: "asc" | "desc" } | null;
 
 function formatValue(value: unknown): React.ReactNode {
   if (value === null || value === undefined || value === "") return <span className="text-muted-foreground/60">—</span>;
@@ -24,6 +33,11 @@ function formatValue(value: unknown): React.ReactNode {
   return String(value);
 }
 
+/**
+ * Presentational table. Rows arrive already filtered/sorted server-side
+ * (`surfaceRows` applies search/filters/orderBy); the header only reports
+ * sort changes via `onSortChange` so the connection can re-query.
+ */
 export function DataTable({
   columns,
   rows,
@@ -32,7 +46,8 @@ export function DataTable({
   selectedIds = new Set<string>(),
   onSelectionChange,
   onUpdate,
-  searchable = true,
+  sort = null,
+  onSortChange,
   suggestions,
   emptyMessage = "No rows.",
   hasNextPage = false,
@@ -46,45 +61,31 @@ export function DataTable({
   selectedIds?: Set<string>;
   onSelectionChange?: (ids: Set<string>) => void;
   onUpdate?: (id: string, values: Record<string, unknown>) => Promise<void> | void;
-  searchable?: boolean;
+  sort?: SortState;
+  onSortChange?: (sort: SortState) => void;
   suggestions?: Record<string, string[]>;
   emptyMessage?: string;
   hasNextPage?: boolean;
   totalCount?: number;
   onLoadMore?: () => void;
 }) {
-  const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<SortState>(null);
   const [editCell, setEditCell] = useState<{ rowId: string; field: string } | null>(null);
   const [draft, setDraft] = useState("");
 
   const sortedColumns = useMemo(() => [...columns].sort((a, b) => a.order - b.order), [columns]);
 
-  const filteredRows = useMemo(() => {
-    let result = rows;
-    const q = query.trim().toLowerCase();
-    if (q) {
-      result = result.filter((row) =>
-        sortedColumns.some((column) => String(row.values[column.field] ?? "").toLowerCase().includes(q)),
-      );
-    }
-    if (sort) {
-      result = [...result].sort((a, b) => {
-        const av = a.values[sort.field];
-        const bv = b.values[sort.field];
-        if (av === bv) return 0;
-        const cmp = av === null || av === undefined ? -1 : bv === null || bv === undefined ? 1 : av < bv ? -1 : 1;
-        return sort.dir === "asc" ? cmp : -cmp;
-      });
-    }
-    return result;
-  }, [rows, query, sort, sortedColumns]);
+  const cycleSort = (field: string) => {
+    if (!onSortChange) return;
+    onSortChange(
+      sort?.field === field ? (sort.dir === "asc" ? { field, dir: "desc" } : null) : { field, dir: "asc" },
+    );
+  };
 
-  const allSelected = filteredRows.length > 0 && filteredRows.every((row) => selectedIds.has(row.id));
+  const allSelected = rows.length > 0 && rows.every((row) => selectedIds.has(row.id));
 
   const toggleAll = (checked: boolean) => {
     const next = new Set(selectedIds);
-    for (const row of filteredRows) {
+    for (const row of rows) {
       if (checked) next.add(row.id);
       else next.delete(row.id);
     }
@@ -114,17 +115,6 @@ export function DataTable({
 
   return (
     <div className="flex h-full flex-col">
-      {searchable && (
-        <div className="relative m-2 mb-0 w-full max-w-xs">
-          <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-          <Input
-            className="pl-8"
-            placeholder="Filter rows…"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
-        </div>
-      )}
       <div className="flex-1 overflow-auto p-2">
         <Table>
           <TableHeader>
@@ -137,16 +127,8 @@ export function DataTable({
               {sortedColumns.map((column) => (
                 <TableHead
                   key={column.field}
-                  className={cn("cursor-pointer select-none", sort?.field === column.field && "text-foreground")}
-                  onClick={() =>
-                    setSort((prev) =>
-                      prev?.field === column.field
-                        ? prev.dir === "asc"
-                          ? { field: column.field, dir: "desc" }
-                          : null
-                        : { field: column.field, dir: "asc" },
-                    )
-                  }
+                  className={cn("cursor-pointer select-none", onSortChange && "hover:text-foreground", sort?.field === column.field && "text-foreground")}
+                  onClick={() => cycleSort(column.field)}
                 >
                   <span className="inline-flex items-center gap-1">
                     {column.label}
@@ -161,14 +143,14 @@ export function DataTable({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {filteredRows.length === 0 && (
+            {rows.length === 0 && (
               <TableRow>
                 <TableCell colSpan={sortedColumns.length + (selectable ? 1 : 0)} className="h-24 text-center text-muted-foreground">
                   {emptyMessage}
                 </TableCell>
               </TableRow>
             )}
-            {filteredRows.map((row) => (
+            {rows.map((row) => (
               <TableRow key={row.id} data-selected={selectedIds.has(row.id) ? "true" : undefined}>
                 {selectable && (
                   <TableCell>
@@ -190,29 +172,16 @@ export function DataTable({
                       onDoubleClick={() => beginEdit(row, column.field)}
                     >
                       {editing ? (
-                        suggestionsFor && suggestionsFor.length > 0 ? (
-                          <SuggestInput
-                            autoFocus
-                            value={draft}
-                            onChange={setDraft}
-                            onCommit={(v) => void commitEdit(v)}
-                            onCancel={() => setEditCell(null)}
-                            suggestions={suggestionsFor}
-                            className="h-8"
-                          />
-                        ) : (
-                          <Input
-                            autoFocus
-                            value={draft}
-                            onChange={(event) => setDraft(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") void commitEdit();
-                              if (event.key === "Escape") setEditCell(null);
-                            }}
-                            onBlur={() => void commitEdit()}
-                            className="h-8"
-                          />
-                        )
+                        <TypedInput
+                          autoFocus
+                          type={column.type}
+                          value={draft}
+                          onChange={setDraft}
+                          onCommit={(v) => void commitEdit(v)}
+                          onCancel={() => setEditCell(null)}
+                          suggestions={suggestionsFor}
+                          className="h-8"
+                        />
                       ) : (
                         formatValue(value)
                       )}
@@ -226,7 +195,7 @@ export function DataTable({
       </div>
       <div className="flex items-center justify-between border-t px-3 py-2 text-xs text-muted-foreground">
         <span>
-          {filteredRows.length} of {totalCount ?? rows.length} row{(totalCount ?? rows.length) === 1 ? "" : "s"}
+          {rows.length} of {totalCount ?? rows.length} row{(totalCount ?? rows.length) === 1 ? "" : "s"}
         </span>
         {hasNextPage && (
           <Button size="sm" variant="outline" onClick={onLoadMore}>

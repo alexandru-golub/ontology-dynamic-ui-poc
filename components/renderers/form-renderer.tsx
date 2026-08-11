@@ -2,9 +2,8 @@
 
 import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SuggestInput } from "@/components/suggest-input";
+import { TypedInput } from "@/components/typed-input";
 import { cn } from "@/lib/utils";
 import { formatCell, sortedColumns, type RendererProps } from "./types";
 
@@ -106,19 +105,13 @@ export function FormRenderer({
                     {column.source ?? column.field}
                   </span>
                 </Label>
-                {suggestions[column.field] ? (
-                  <SuggestInput
-                    value={draft[column.field] ?? ""}
-                    onChange={(v) => setDraft((p) => ({ ...p, [column.field]: v }))}
-                    onCommit={() => undefined}
-                    suggestions={suggestions[column.field]}
-                  />
-                ) : (
-                  <Input
-                    value={draft[column.field] ?? ""}
-                    onChange={(e) => setDraft((p) => ({ ...p, [column.field]: e.target.value }))}
-                  />
-                )}
+                <TypedInput
+                  type={column.type}
+                  value={draft[column.field] ?? ""}
+                  onChange={(v) => setDraft((p) => ({ ...p, [column.field]: v }))}
+                  onCommit={() => undefined}
+                  suggestions={suggestions[column.field]}
+                />
               </div>
             ))}
             {(canUpdate || (creating && canCreate)) && (

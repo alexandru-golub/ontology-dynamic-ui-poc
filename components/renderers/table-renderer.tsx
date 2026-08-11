@@ -15,6 +15,8 @@ export function DataTableRenderer({
   hasNextPage,
   totalCount,
   onLoadMore,
+  sort,
+  onSortChange,
 }: RendererProps) {
   return (
     <div className="h-full">
@@ -30,6 +32,8 @@ export function DataTableRenderer({
         hasNextPage={hasNextPage}
         totalCount={totalCount}
         onLoadMore={onLoadMore}
+        sort={sort}
+        onSortChange={onSortChange}
       />
     </div>
   );
