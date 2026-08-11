@@ -55,6 +55,20 @@ CREATE (peopleSurface)-[:HAS_COLUMN]->(e1)
 CREATE (peopleSurface)-[:HAS_COLUMN]->(e2)
 CREATE (peopleSurface)-[:HAS_COLUMN]->(e3)
 
+// Project Board — rows are Projects; the board renderer groups by Status and
+// cards are dragged between lanes (a generic updateRow on the grouping field).
+CREATE (boardSurface:Surface {id: 'board', title: 'Project Board', name: 'Projects Board', renderer: 'board', rootLabel: 'Project'})
+CREATE (f1:Column {id: 'colb_project', field: 'project', label: 'Project Title', order: 1, source: 'self.name'})
+CREATE (f2:Column {id: 'colb_status', field: 'status', label: 'Status', order: 2, source: '>HAS_STATUS:Status.name', suggest: true})
+CREATE (f3:Column {id: 'colb_customer', field: 'customer', label: 'Customer', order: 3, source: '<HAS_PROJECT:Customer.name', suggest: true})
+CREATE (f4:Column {id: 'colb_owner', field: 'owner', label: 'Owner', order: 4, source: 'self.owner', suggest: true})
+CREATE (f5:Column {id: 'colb_budget', field: 'budget', label: 'Budget (USD)', order: 5, source: 'self.budget'})
+CREATE (boardSurface)-[:HAS_COLUMN]->(f1)
+CREATE (boardSurface)-[:HAS_COLUMN]->(f2)
+CREATE (boardSurface)-[:HAS_COLUMN]->(f3)
+CREATE (boardSurface)-[:HAS_COLUMN]->(f4)
+CREATE (boardSurface)-[:HAS_COLUMN]->(f5)
+
 // ---- Business data -------------------------------------------------------
 CREATE (acme:Customer {id: 'customer_acme', name: 'Acme Corp'})
 CREATE (globex:Customer {id: 'customer_globex', name: 'Globex'})
@@ -82,6 +96,10 @@ CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: tru
 CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(projectsSurface)
 CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(customersSurface)
 
+// Project Board — Sales can move cards between lanes (update); Analyst read-only.
+CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(boardSurface)
+CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(boardSurface)
+
 // Everyone can view People & Roles; only admins (flag) can manage users there.
 CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
 CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
@@ -93,7 +111,7 @@ async function seed() {
     for (const constraint of constraints) await session.run(constraint);
     await session.run(clearQuery);
     await session.run(query);
-    console.log("Seeded admin, 2 demo users, 3 multi-source surfaces and permissions.");
+    console.log("Seeded admin, 2 demo users, 4 multi-source surfaces and permissions.");
   } finally {
     await session.close();
     await driver.close();

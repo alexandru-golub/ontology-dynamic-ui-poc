@@ -29,7 +29,7 @@ Open http://localhost:3000. Neo4j Browser: http://localhost:7477 (neo4j / local-
 | User | Role | Capabilities |
 | ---- | ---- | ------------ |
 | Ada Admin (`admin_001`) | Super admin (`isAdmin: true`) | Everything + **Admin console** (users, roles, grants, overrides, surfaces) |
-| John Doe (`user_101`) | Sales | Row CRUD on Project Overview (delete via override), manage on Customer Portfolio |
+| John Doe (`user_101`) | Sales | Row CRUD on Project Overview (delete via override), manage on Customer Portfolio, **drag cards between lanes on Project Board** |
 | Jane Smith (`user_202`) | Analyst | Read-only + export everywhere |
 
 ## The ideas
@@ -74,6 +74,8 @@ Seeded examples of one surface mixing many node types:
   project and the largest project budget.
 - **People & Roles** — rows are `User` nodes; columns come from the user
   (`name`, `isAdmin`) and their linked `Role`.
+- **Project Board** — same rows as Project Overview but rendered as a kanban
+  board grouped by `Status`; Sales can drag projects between Active / Draft / Done.
 
 Adding a column with a new source is a graph write — no frontend code needed.
 
@@ -106,7 +108,7 @@ shares one source of options. New values are still allowed.
 | `table` | editable DataTable (sorting, filter, inline edit, selection, Load more) |
 | `cards` | card grid with per-card selection |
 | `form` | record list + editable form (create/update) |
-| `board` | kanban lanes grouped by a status-like column |
+| `board` | kanban lanes grouped by a status-like column; **drag cards between lanes** to re-group (writes the grouping field) |
 | `timeline` | vertical feed of records |
 
 Switch renderers from the **Manage surface** dialog or the admin surface
@@ -150,19 +152,57 @@ CSV export pages through everything client-side.
 (Any root node, e.g. Project)-[:HAS_STATUS]->(Status)        // whatever the sources point at
 ```
 
-## Next steps
+## Roadmap / next steps
 
-Done in this round: renderer registry (3), generic typed-relationship writes (4),
-cursor paging (5), column reorder UI (6), guardrails incl. soft delete (7).
+Status legend: ✅ implemented · 🔜 next · 💭 later.
 
-Remaining:
-1. **Real auth** — replace the `x-user-id` demo header with verified JWT claims
-   (Clerk/Auth0/Supabase) so `me` and the permission graph map to real sessions.
-2. **Row-level security** — surfaces are permission-gated per node type; add
-   tenant/owner scoping (`WHERE` clauses from user context) when multiple
-   organizations share the graph.
-3. **Board drag-between-lanes** — lanes are display-only today; wire moving a
-   card to another lane to an `updateRow` on the grouping field.
+### Auth & security
+- 🔜 **Real authentication** — replace the demo `x-user-id` header in
+  `app/api/graphql/route.ts` with verified JWT claims (Clerk/Auth0/Supabase) so
+  `me` and the permission graph map to real sessions instead of a header.
+- 🔜 **Row-level security** — surfaces are permission-gated per node type; add
+  tenant/owner scoping (`WHERE` clauses derived from the user context) when
+  multiple organizations share the graph.
+- 💭 **Audit trail** — log who changed which row/surface/column and when
+  (versioned `AuditEvent` nodes or a change feed).
+
+### Surfaces & renderers
+- ✅ **Renderer registry** — `table`, `cards`, `form`, `board`, `timeline`
+  renderers resolved from `Surface.renderer`; unknown values fall back to table.
+- ✅ **Board drag-between-lanes** — cards drag between lanes via HTML5 DnD; the
+  drop is an `updateRow` on the grouping field (empty = Unassigned), so it works
+  for every board surface with a relationship-backed grouping column.
+- 🔜 **Form renderer v2** — field-level validation, select/date widgets,
+  multi-record editing.
+- 💭 **New renderers** — pivot/grid-aggregate, Gantt, calendar, nested-detail
+  tables; each new renderer is one more entry in the registry.
+
+### Data & sources
+- ✅ **Typed relationship writes** — `>Rel:Label.prop` / `<Rel:Label.prop`
+  sources are read *and* written generically (create/relink neighbors).
+- ✅ **Cursor paging** — `surfaceRows(first, after)` connection with
+  `totalCount`; the table shows N of M + Load more.
+- 🔜 **Search & filters server-side** — today filtering is client-side on the
+  loaded page; push query/filter/order into the row connection for large graphs.
+- 💭 **Computed/aggregate sources** — e.g. `sum`, `avg`, `max` over typed
+  relationships (`>HAS_LINE_ITEM:LineItem.total.sum`), stored as column sources.
+
+### Schema evolution & guardrails
+- ✅ **Unique constraints** on node ids/names; friendly duplicate errors.
+- ✅ **Write-time validation** of `rootLabel`, column `source`, `renderer`.
+- ✅ **Soft delete** for surfaces (archive / restore / purge).
+- 💭 **Field typing on columns** (`string | number | boolean | date | money`)
+  with per-column validation on create/update.
+- 💭 **Versioned surface definitions** — snapshot a surface's columns on change
+  so the "always-evolving UI" can be diffed, rolled back, or A/B-tested.
+
+### Quality & operations
+- 🔜 **Row-level permissions demo** — the machinery exists (roles/overrides);
+  add row-owner properties and a `rowAccess` hook so surfaces can filter rows.
+- 💭 **Integration/webhooks** — emit change events (create/update/delete) so
+  other systems can react to graph changes.
+- 💭 **Export options** — per-renderer export (cards → PDF, board → markdown),
+  column selection, and full-column-set CSV (already exports all pages).
 
 ## Production notes
 
