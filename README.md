@@ -18,23 +18,60 @@ the permission graph on the server.
 cp .env.example .env.local
 docker compose up -d neo4j
 npm install
-npm run seed
+npm run seed        # prints generated passwords unless HAT_PASSWORD is set
 npm run dev
 ```
 
-Open http://localhost:3000. Neo4j Browser: http://localhost:7477 (neo4j / local-dev-password).
+Open http://localhost:3000 → you are redirected to `/login`. Neo4j Browser: http://localhost:7477 (neo4j / local-dev-password).
 
-## Demo users (switch top-right)
+**First login:** `npm run seed` seeds three demo accounts (all using `HAT_PASSWORD` from `.env.local`, or random passwords it prints):
+`admin_001` / `user_101` / `user_202` / `user_303`. Add real people with
+`npm run user:create -- --id alice --name Alice --password secret --roles "Project Manager"` or from the
+Admin console → Users → *Set password*.
 
-| User | Role | Capabilities |
-| ---- | ---- | ------------ |
-| Ada Admin (`admin_001`) | Super admin (`isAdmin: true`) | Everything + **Admin console** (users, roles, grants, overrides, surfaces, **audit trail**) |
-| John Doe (`user_101`) | Sales | Row CRUD on Project Overview (delete via override), manage on Customer Portfolio, **drag cards between lanes on Project Board**, **multi-record editing on Project Intake** |
-| Jane Smith (`user_202`) | Analyst | Read-only + export everywhere |
+## Hats & demo accounts
+
+Real people are `User` nodes; **hats are `Role` nodes** (Project Manager, Business
+Development, Software Engineer…). A person can wear several hats; the session
+remembers which hat is active, and permission checks resolve through *that* hat
+only — so switching hats literally shows you what each hat can see. Wearing no
+hat = the union of every role you hold. Invited people get their own `User`
+account (admin console → *Set password*) plus the hats you assign.
+
+| Account | Hats (roles) | Capabilities |
+| ------- | ------------ | ------------ |
+| Ada Admin (`admin_001`) | Admin | Super admin — everything + **Admin console** (users, passwords, roles, grants, surfaces, **audit trail**) |
+| John Doe (`user_101`) | Project Manager | Row CRUD on Project Overview (delete via override), manage Customer Portfolio, drag board cards, multi-record editing on Project Intake |
+| Jane Smith (`user_202`) | Business Development | Read-only + export everywhere; create/edit on Project Intake |
+| Sam Rivera (`user_303`) | Software Engineer | Read-only + export; update statuses on Project Board |
 
 ## The ideas
 
-### 1. Admin console
+### 1. DB-backed auth & hats
+Authentication is graph-native — no external identity provider, no JWTs.
+
+- **Passwords** are bcrypt-hashed (`bcryptjs`) and stored on the `User` node
+  (`passwordHash`). Set/reset them from the Admin console (*Set password*) or
+  the `user:create` CLI.
+- **Sessions live in Neo4j**: login mints a random opaque token, stores only its
+  SHA-256 hash on a `Session` node (`(User)-[:HAS_SESSION]->(Session {tokenHash,
+  expiresAt, roleName})`), and hands the token to the browser in an httpOnly,
+  SameSite=Lax cookie. Every API request resolves the user by looking the hash
+  up in the graph; logout deletes the node. A leaked database cannot replay
+  sessions.
+- **Hats** are roles: `Session.roleName` records the hat currently worn.
+  `fetchPermissions`/`listSurfaces` filter grants by that role, so wearing the
+  *Project Manager* hat shows PM surfaces with PM permissions, and wearing
+  *Software Engineer* shows the engineer view. The 🎩 menu in the header
+  switches hats (any hat you hold) or clears back to *All hats*.
+- **Audit**: login, logout and hat switches are recorded as `AuditEvent`s
+  (action `LOGIN` / `LOGOUT` / `HAT`), alongside row/surface changes.
+- **Enforcement**: the GraphQL route resolves the user from the cookie
+  server-side (the old `x-user-id` header is gone); middleware redirects
+  anonymous page loads to `/login` and answers API calls with 401 JSON. Local
+  dev can set `AUTH_BYPASS_USER` to skip login entirely — never in production.
+
+### 2. Admin console
 A super-privileged user (`User.isAdmin = true`) bypasses all permission checks
 and gets an **Admin console** in the sidebar with three tabs:
 - **Users** — create/delete users, toggle admin, assign/remove roles
@@ -44,12 +81,12 @@ and gets an **Admin console** in the sidebar with three tabs:
 All `admin*` GraphQL mutations are guarded by `requireAdmin` server-side — the
 UI hiding is not the security boundary.
 
-### 2. shadcn/ui
+### 3. shadcn/ui
 MUI was removed entirely (page bundle: 249 kB → ~73 kB). Components live
 in `components/ui/*` (button, dialog, select, tabs, checkbox, table, badge,
 alert, card, input, label, textarea) built on Radix primitives + Tailwind v4.
 
-### 3. Multi-source surfaces
+### 4. Multi-source surfaces
 A surface is rooted at a node label (`Surface.rootLabel`) and each column
 carries a `source` that tells the projector where to pull the value from:
 
@@ -100,7 +137,7 @@ Seeded surfaces:
 
 Adding a column with a new source is a graph write — no frontend code needed.
 
-### 4. Per-field value suggestions
+### 5. Per-field value suggestions
 Every column can turn **existing-value suggestions** on or off
 (`Column.suggest`), independently for each field — set it when creating the
 surface, or toggle it any time from the **Manage surface** dialog.
@@ -120,7 +157,7 @@ shares one source of options. New values are still allowed.
 
 `getSurface` returns `suggestions { field values }` for suggest-enabled columns.
 
-### 5. Renderer registry
+### 6. Renderer registry
 `Surface.renderer` is graph data; the frontend resolves it through a registry in
 `components/renderers/`:
 
@@ -140,7 +177,7 @@ creator; unknown renderer values fall back to the table with a notice. Pivot and
 gantt use the surface's columns positionally (row dim, col dim, value — and
 name, start, due), so they're configured entirely in the graph.
 
-### 6. Paged rows, server-side search & filters
+### 7. Paged rows, server-side search & filters
 `getSurface` returns metadata (columns/permissions/suggestions); rows come from
 `surfaceRows(surfaceId, first, after, search, filters, orderBy)` — a cursor
 connection (`edges { cursor node }`, `pageInfo`, `totalCount`).
@@ -155,7 +192,7 @@ Load more, the board lanes and CSV export all apply to the filtered set. The
 toolbar search box (debounced) and the *Filters* dialog drive them; clicking a
 column header sorts. Cursor = base64 offset into the filtered/ordered result.
 
-### 7. Field typing on columns
+### 8. Field typing on columns
 Every column carries a `type` (`string | number | boolean | date | money`,
 default `string`) — graph data, like everything else. Writes are coerced and
 validated server-side: `"$12,345.67"` → `12345.67` for money, `"true"`/`yes`/`1`
@@ -165,7 +202,7 @@ editors: number/date inputs, a yes/no select for booleans, suggestion comboboxes
 where enabled. Set the type in the surface creator (`field|label|source|order|suggest|type`)
 or the Manage-surface dialog.
 
-### 8. Per-field validation rules + form renderer v2
+### 9. Per-field validation rules + form renderer v2
 Every column can carry **validation rules as graph data** — same as everything else
 in this app. They are stored on the `Column` node, returned in
 `ColumnMetadata`, and **enforced server-side on every write** (`createRow`,
@@ -198,7 +235,7 @@ is sent. Server errors aggregate all failing fields into one message
 Set rules when creating a surface (admin console, extended column line) or any
 time from **Manage surface → Edit column**.
 
-### 9. Audit trail
+### 10. Audit trail
 Every row create/update/delete and every surface/column definition change writes
 an `AuditEvent` node (`(User)-[:PERFORMED]->(AuditEvent)`) in the same
 transaction as the change: actor, action, surface, target and a JSON `changes`
@@ -206,7 +243,7 @@ diff (`{ field: { from, to } }` for updates, full values for create/delete).
 The admin console's **Audit** tab lists the trail newest-first with Load more;
 `auditEvents` is admin-only.
 
-### 10. Guardrails
+### 11. Guardrails
 - **Unique constraints** (created by `npm run seed`) on `User.id`, `Surface.id`,
   `Column.id`, `Role.name`, `Customer.name`, `Status.name`, `Project.id`;
   duplicate creates return friendly errors.
@@ -222,11 +259,15 @@ The admin console's **Audit** tab lists the trail newest-first with Load more;
 
 ## API surface
 
+**Auth routes:** `POST /api/auth/login` (username+password → httpOnly session cookie),
+`POST /api/auth/logout`, `GET /api/auth/session` (current user + hats),
+`POST /api/auth/hat` (switch active hat).
+
 `Query`: `me`, `getSurface` (incl. `suggestions`, column `type` **and validation rules**), `surfaceRows(surfaceId, first, after, search, filters, orderBy)` (paged connection), `listSurfaces`, `auditEvents` (admin), `adminUsers`, `adminRoles`, `adminSurfaces`
 `Mutation`:
 - rows: `createRow`, `updateRow`, `deleteRows` (generic over the surface's root label)
 - surface definitions: `updateSurface`, `addColumn`, `updateColumn`, `deleteColumn`
-- admin: `adminCreateUser`, `adminUpdateUser`, `adminDeleteUser`, `adminCreateRole`,
+- admin: `adminCreateUser`, `adminUpdateUser`, `adminDeleteUser`, `adminSetPassword`, `adminCreateRole`,
   `adminDeleteRole`, `adminAssignRole`, `adminRemoveRole`, `adminGrant`, `adminRevoke`,
   `adminSetOverride`, `adminClearOverride`, `adminCreateSurface`, `adminUpdateSurface`,
   `adminDeleteSurface`, `adminRestoreSurface`, `adminPurgeSurface`
@@ -236,6 +277,7 @@ The admin console's **Audit** tab lists the trail newest-first with Load more;
 ```
 (User)-[:HAS_ROLE]->(Role)-[:CAN_ACCESS {view,create,update,delete,export,manage}]->(Surface)
 (User)-[:SURFACE_OVERRIDE {view?,create?,...}]->(Surface)   // per-user boolean override
+(User {id,name,isAdmin,passwordHash})-[:HAS_SESSION]->(Session {tokenHash,expiresAt,roleName})  // roleName = active hat
 (Surface)-[:HAS_COLUMN]->(Column {field,label,order,source,suggest,suggestSource,type,required,min,max,minLength,maxLength,pattern,options,validationMessage})  // source: self.prop | >Rel:Label.prop | <Rel:Label.prop | Label.count
 (Any root node, e.g. Project)-[:HAS_STATUS]->(Status)        // whatever the sources point at
 ```
@@ -245,9 +287,13 @@ The admin console's **Audit** tab lists the trail newest-first with Load more;
 Status legend: ✅ implemented · 🔜 next · 💭 later.
 
 ### Auth & security
-- 🔜 **Real authentication** — replace the demo `x-user-id` header in
-  `app/api/graphql/route.ts` with verified JWT claims (Clerk/Auth0/Supabase) so
-  `me` and the permission graph map to real sessions instead of a header.
+- ✅ **DB-backed authentication** — bcrypt passwords on `User`, sessions stored
+  in the graph (`Session` nodes, hashed tokens, httpOnly cookie), logout
+  revokes, login/logout/hat-switch audited. No external identity provider.
+- ✅ **Hats = roles** — real people are `User`s; hats are `Role`s; the session
+  wears one hat at a time so each hat sees only its surfaces/permissions
+  (plus an *All hats* mode). Invite people by creating a user + setting a
+  password + assigning roles.
 - 🔜 **Row-level security** — surfaces are permission-gated per node type; add
   tenant/owner scoping (`WHERE` clauses derived from the user context) when
   multiple organizations share the graph.
@@ -313,7 +359,8 @@ Status legend: ✅ implemented · 🔜 next · 💭 later.
 
 ## Production notes
 
-Replace the demo `x-user-id` header context in `app/api/graphql/route.ts` with
-verified JWT claims from Clerk/Auth0/Supabase. The server already enforces
+Auth is fully DB-backed (see section 1); run it behind Cloudflare Zero Trust (or
+any VPN) and set `HAT_PASSWORD`/real per-user passwords. The server enforces
 permissions on every mutation; add row-level data filtering when multiple
-tenants share surfaces.
+tenants share surfaces. Back up the Neo4j data directory (`neo4j/data`) — it
+holds rows, definitions, sessions and the audit trail.

@@ -1,6 +1,7 @@
 import { GraphQLError } from "graphql";
 import { isInt } from "neo4j-driver";
 import { randomUUID } from "node:crypto";
+import { hashPassword } from "./auth";
 import { driver } from "./neo4j";
 
 // ---------------------------------------------------------------------------
@@ -636,13 +637,14 @@ export async function getUser(userId: string): Promise<UserInfo | null> {
   }
 }
 
-async function fetchPermissions(userId: string, surfaceId: string): Promise<Permissions | null> {
+async function fetchPermissions(userId: string, surfaceId: string, roleName: string | null = null): Promise<Permissions | null> {
   const session = driver.session({ defaultAccessMode: "READ" });
   try {
     const result = await session.run(
       `
 MATCH (u:User {id: $userId}), (s:Surface {id: $surfaceId})
-OPTIONAL MATCH (u)-[:HAS_ROLE]->(:Role)-[rolePermission:CAN_ACCESS]->(s)
+OPTIONAL MATCH (u)-[:HAS_ROLE]->(r:Role)-[rolePermission:CAN_ACCESS]->(s)
+WHERE $roleName IS NULL OR r.name = $roleName
 WITH u, s, [permission IN collect(properties(rolePermission)) WHERE permission IS NOT NULL] AS rolePermissions
 OPTIONAL MATCH (u)-[userOverride:SURFACE_OVERRIDE]->(s)
 WITH rolePermissions, head(collect(properties(userOverride))) AS override
@@ -654,7 +656,7 @@ RETURN {
   export: CASE WHEN override.export = false THEN false WHEN override.export = true THEN true ELSE any(p IN rolePermissions WHERE p.export = true) END,
   manage: CASE WHEN override.manage = false THEN false WHEN override.manage = true THEN true ELSE any(p IN rolePermissions WHERE p.manage = true) END
 } AS permissions`,
-      { userId, surfaceId },
+      { userId, surfaceId, roleName },
     );
     if (!result.records.length) return null;
     return result.records[0].get("permissions") as Permissions;
@@ -667,10 +669,15 @@ function forbid(permission: string): never {
   throw new GraphQLError(`Missing '${permission}' permission for this surface`, { extensions: { code: "FORBIDDEN" } });
 }
 
-export async function requirePermission(userId: string, surfaceId: string, permission: keyof Permissions): Promise<Permissions> {
+export async function requirePermission(
+  userId: string,
+  surfaceId: string,
+  permission: keyof Permissions,
+  roleName: string | null = null,
+): Promise<Permissions> {
   const user = await getUser(userId);
   if (user?.isAdmin) return { ...ALL_TRUE };
-  const permissions = await fetchPermissions(userId, surfaceId);
+  const permissions = await fetchPermissions(userId, surfaceId, roleName);
   if (!permissions) throw new GraphQLError("Surface not found", { extensions: { code: "NOT_FOUND" } });
   if (!permissions.view) forbid("view");
   if (!permissions[permission]) forbid(permission);
@@ -770,8 +777,8 @@ function writableLinkKinds(surface: SurfaceMeta): Array<{ rel: string; dir: "in"
 
 type AuditInput = {
   actorId: string;
-  action: "CREATE" | "UPDATE" | "DELETE";
-  surfaceId: string;
+  action: "CREATE" | "UPDATE" | "DELETE" | "LOGIN" | "LOGOUT" | "HAT";
+  surfaceId?: string | null;
   surfaceTitle?: string | null;
   targetId?: string | null;
   targetLabel?: string | null;
@@ -803,6 +810,10 @@ function auditParams(audit: AuditInput, surface: SurfaceMeta): Record<string, un
 
 export async function createRow(surfaceId: string, values: Record<string, unknown>, actorId: string): Promise<SurfaceRow> {
   const surface = await getSurfaceMeta(surfaceId);
+  // Validate the *complete* row: omitted fields count as blank, so required
+  // columns cannot be bypassed by simply not sending them.
+  const defaults = Object.fromEntries(surface.columns.map((c) => [c.field, ""]));
+  validateColumnValues(surface.columns, { ...defaults, ...values });
   const { props, neighbors } = routeValues(surface.columns, values);
   const label = sanitizeLabel(surface.rootLabel);
   const specs = Object.values(neighbors);
@@ -1096,7 +1107,7 @@ export async function surfaceRowsPage(
 // ---------------------------------------------------------------------------
 // Surfaces (shared helpers)
 // ---------------------------------------------------------------------------
-export async function listSurfaces(userId: string) {
+export async function listSurfaces(userId: string, roleName: string | null = null) {
   const user = await getUser(userId);
   if (user?.isAdmin) {
     const session = driver.session({ defaultAccessMode: "READ" });
@@ -1114,7 +1125,8 @@ export async function listSurfaces(userId: string) {
     const result = await session.run(
       `
 MATCH (u:User {id: $userId})
-OPTIONAL MATCH (u)-[:HAS_ROLE]->(:Role)-[p:CAN_ACCESS]->(s:Surface)
+OPTIONAL MATCH (u)-[:HAS_ROLE]->(r:Role)-[p:CAN_ACCESS]->(s:Surface)
+WHERE $roleName IS NULL OR r.name = $roleName
 OPTIONAL MATCH (u)-[o:SURFACE_OVERRIDE]->(s)
 WITH s, [permission IN collect(properties(p)) WHERE permission IS NOT NULL] AS rolePermissions, head(collect(properties(o))) AS override
 WHERE s IS NOT NULL AND coalesce(s.deleted, false) = false
@@ -1122,7 +1134,7 @@ WITH s, CASE WHEN override.view = false THEN false WHEN override.view = true THE
 WHERE canView
 RETURN s.id AS id, coalesce(s.title, s.name) AS title, s.renderer AS renderer, coalesce(s.rootLabel, 'Project') AS rootLabel
 ORDER BY s.id`,
-      { userId },
+      { userId, roleName },
     );
     return result.records.map((record) => record.toObject());
   } finally {
@@ -1163,8 +1175,8 @@ export async function getSuggestions(surface: SurfaceMeta): Promise<Array<{ fiel
   }
 }
 
-export async function getSurfacePayload(userId: string, surfaceId: string) {
-  const permissions = await requirePermission(userId, surfaceId, "view");
+export async function getSurfacePayload(userId: string, surfaceId: string, roleName: string | null = null) {
+  const permissions = await requirePermission(userId, surfaceId, "view", roleName);
   const surface = await getSurfaceMeta(surfaceId);
   const [rows, suggestions] = await Promise.all([runSurfaceRows(surface), getSuggestions(surface)]);
   return {
@@ -1189,13 +1201,39 @@ export async function adminUsers(): Promise<unknown[]> {
       `
 MATCH (u:User)
 OPTIONAL MATCH (u)-[:HAS_ROLE]->(r:Role)
-RETURN u.id AS id, u.name AS name, coalesce(u.isAdmin, false) AS isAdmin, collect(DISTINCT r.name) AS roles
+RETURN u.id AS id, u.name AS name, coalesce(u.isAdmin, false) AS isAdmin,
+       coalesce(u.passwordHash IS NOT NULL, false) AS hasPassword,
+       collect(DISTINCT r.name) AS roles
 ORDER BY u.id`,
     );
     return result.records.map((record) => {
       const obj = record.toObject();
-      return { id: obj.id, name: obj.name, isAdmin: Boolean(obj.isAdmin), roles: obj.roles as string[] };
+      return {
+        id: obj.id,
+        name: obj.name,
+        isAdmin: Boolean(obj.isAdmin),
+        hasPassword: Boolean(obj.hasPassword),
+        roles: obj.roles as string[],
+      };
     });
+  } finally {
+    await session.close();
+  }
+}
+
+/**
+ * Set (or reset) a user's password so they can log in. Passwords are stored
+ * as bcrypt hashes; the admin console uses this to provision invited people
+ * and to rotate forgotten passwords.
+ */
+export async function adminSetPassword(id: string, password: string): Promise<boolean> {
+  const session = driver.session({ defaultAccessMode: "WRITE" });
+  try {
+    const result = await session.run(
+      `MATCH (u:User {id: $id}) SET u.passwordHash = $hash RETURN count(u) AS cnt`,
+      { id, hash: hashPassword(password) },
+    );
+    return result.records[0].get("cnt").toNumber() > 0;
   } finally {
     await session.close();
   }

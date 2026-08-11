@@ -24,6 +24,7 @@ import {
   adminRemoveRole,
   adminRevoke,
   adminRoles,
+  adminSetPassword,
   adminSetOverride,
   adminSurfaces,
   adminUpdateSurface,
@@ -194,6 +195,7 @@ type AdminUser {
   id: ID!
   name: String!
   isAdmin: Boolean!
+  hasPassword: Boolean!
   roles: [String!]!
 }
 
@@ -310,6 +312,7 @@ type Mutation {
   adminCreateUser(input: AdminUserInput!): AdminUser!
   adminUpdateUser(id: ID!, input: AdminUserPatch!): AdminUser!
   adminDeleteUser(id: ID!): Boolean!
+  adminSetPassword(id: ID!, password: String!): Boolean!
   adminCreateRole(name: String!): RoleInfo!
   adminDeleteRole(name: String!): Boolean!
   adminAssignRole(userId: ID!, roleName: String!): AdminUser!
@@ -360,7 +363,11 @@ const JSONScalar = new GraphQLScalarType({
 // ---------------------------------------------------------------------------
 // Schema factory
 // ---------------------------------------------------------------------------
-export function getSchema(userId: string) {
+export type SessionContext = { userId: string; roleName: string | null };
+
+export function getSchema(session: SessionContext) {
+  const userId = session.userId;
+  const roleName = session.roleName;
   const schema = buildSchema(typeDefs);
   const jsonType = schema.getType("JSON") as GraphQLScalarType;
   Object.assign(jsonType, { serialize: JSONScalar.serialize, parseValue: JSONScalar.parseValue, parseLiteral: JSONScalar.parseLiteral });
@@ -377,13 +384,13 @@ export function getSchema(userId: string) {
   };
 
   queryType.getFields().getSurface.resolve = async (_source, { surfaceId }: { surfaceId: string }) =>
-    getSurfacePayload(userId, surfaceId);
+    getSurfacePayload(userId, surfaceId, roleName);
 
   queryType.getFields().surfaceRows.resolve = async (
     _source,
     args: { surfaceId: string; first?: number; after?: string; search?: string; filters?: ColumnFilter[]; orderBy?: ColumnOrder | null },
   ) => {
-    await requirePermission(userId, args.surfaceId, "view");
+    await requirePermission(userId, args.surfaceId, "view", roleName);
     const surface = await getSurfaceMeta(args.surfaceId);
     return surfaceRowsPage(surface, args.first ?? 50, args.after ?? undefined, {
       filters: args.filters,
@@ -400,7 +407,7 @@ export function getSchema(userId: string) {
     return auditEventsPage(first ?? 50, after ?? undefined);
   };
 
-  queryType.getFields().listSurfaces.resolve = async () => listSurfaces(userId);
+  queryType.getFields().listSurfaces.resolve = async () => listSurfaces(userId, roleName);
 
   queryType.getFields().adminUsers.resolve = async () => {
     await requireAdmin(userId);
@@ -422,7 +429,7 @@ export function getSchema(userId: string) {
     _source,
     { surfaceId, values }: { surfaceId: string; values: Record<string, unknown> },
   ) => {
-    await requirePermission(userId, surfaceId, "create");
+    await requirePermission(userId, surfaceId, "create", roleName);
     return createRow(surfaceId, values, userId);
   };
 
@@ -430,7 +437,7 @@ export function getSchema(userId: string) {
     _source,
     { surfaceId, id, values }: { surfaceId: string; id: string; values: Record<string, unknown> },
   ) => {
-    await requirePermission(userId, surfaceId, "update");
+    await requirePermission(userId, surfaceId, "update", roleName);
     return updateRow(surfaceId, id, values, userId);
   };
 
@@ -438,18 +445,18 @@ export function getSchema(userId: string) {
     _source,
     { surfaceId, ids }: { surfaceId: string; ids: string[] },
   ) => {
-    await requirePermission(userId, surfaceId, "delete");
+    await requirePermission(userId, surfaceId, "delete", roleName);
     return deleteRows(surfaceId, ids, userId);
   };
 
   // ---------------- Surface definition CRUD ----------------
-  const refreshSurfacePayload = async (surfaceId: string) => getSurfacePayload(userId, surfaceId);
+  const refreshSurfacePayload = async (surfaceId: string) => getSurfacePayload(userId, surfaceId, roleName);
 
   mutationType.getFields().updateSurface.resolve = async (
     _source,
     { surfaceId, input }: { surfaceId: string; input: { title?: string; renderer?: string; rootLabel?: string } },
   ) => {
-    await requirePermission(userId, surfaceId, "manage");
+    await requirePermission(userId, surfaceId, "manage", roleName);
     if (input.rootLabel) validateRootLabel(input.rootLabel);
     validateRenderer(input.renderer);
     const session = driver.session({ defaultAccessMode: "WRITE" });
@@ -470,7 +477,7 @@ export function getSchema(userId: string) {
     _source,
     { surfaceId, input }: { surfaceId: string; input: { field: string; label: string; order?: number; source?: string; suggest?: boolean; suggestSource?: string; type?: string; required?: boolean; min?: number | null; max?: number | null; minLength?: number | null; maxLength?: number | null; pattern?: string | null; options?: string[] | null; validationMessage?: string | null } },
   ) => {
-    await requirePermission(userId, surfaceId, "manage");
+    await requirePermission(userId, surfaceId, "manage", roleName);
     validateSource(input.source, input.field);
     const columnType = sanitizeColumnType(input.type);
     const rules = sanitizeValidationRules(input);
@@ -535,7 +542,7 @@ export function getSchema(userId: string) {
       input: { field?: string; label?: string; order?: number; source?: string | null; suggest?: boolean; suggestSource?: string | null; type?: string; required?: boolean; min?: number | null; max?: number | null; minLength?: number | null; maxLength?: number | null; pattern?: string | null; options?: string[] | null; validationMessage?: string | null };
     },
   ) => {
-    await requirePermission(userId, surfaceId, "manage");
+    await requirePermission(userId, surfaceId, "manage", roleName);
     if (input.source != null) validateSource(input.source, input.field ?? "field");
     const columnType = input.type === undefined ? undefined : sanitizeColumnType(input.type);
     const surface = await getSurfaceMeta(surfaceId);
@@ -633,6 +640,17 @@ export function getSchema(userId: string) {
   mutationType.getFields().adminDeleteUser.resolve = async (_source, { id }: { id: string }) => {
     await requireAdmin(userId);
     return adminDeleteUser(id);
+  };
+
+  mutationType.getFields().adminSetPassword.resolve = async (
+    _source,
+    { id, password }: { id: string; password: string },
+  ) => {
+    await requireAdmin(userId);
+    if (typeof password !== "string" || password.length < 6) {
+      throw new GraphQLError("Password must be at least 6 characters", { extensions: { code: "BAD_INPUT" } });
+    }
+    return adminSetPassword(id, password);
   };
 
   mutationType.getFields().adminCreateRole.resolve = async (_source, { name }: { name: string }) => {

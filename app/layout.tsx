@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { ApolloProvider } from "@/components/apollo-provider";
+import { SessionProvider } from "@/components/session-provider";
 
 export const metadata: Metadata = {
   title: "Graph Surfaces",
@@ -11,7 +12,9 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   return (
     <html lang="en">
       <body>
-        <ApolloProvider>{children}</ApolloProvider>
+        <ApolloProvider>
+          <SessionProvider>{children}</SessionProvider>
+        </ApolloProvider>
       </body>
     </html>
   );

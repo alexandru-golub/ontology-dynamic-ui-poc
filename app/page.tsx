@@ -1,40 +1,45 @@
 "use client";
 
 import { gql, useApolloClient, useQuery } from "@apollo/client";
-import { ShieldCheck } from "lucide-react";
+import { LogOut, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import { AdminPanel } from "@/components/admin-panel";
-import { DEMO_USERS, useDemoUser } from "@/components/apollo-provider";
+import { useSession } from "@/components/session-provider";
 import { DynamicSurface } from "@/components/surface-renderer";
 import { SurfacesNav } from "@/components/surfaces-nav";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
-const ME = gql`
-  query Me {
-    me {
+const LIST_SURFACES = gql`
+  query ListSurfaces {
+    listSurfaces {
       id
-      name
-      isAdmin
+      title
     }
   }
 `;
 
 export default function Home() {
-  const { user, setUser } = useDemoUser();
-  const { data: meData } = useQuery<{ me: { id: string; name: string; isAdmin: boolean } }>(ME, {
-    fetchPolicy: "no-cache",
-  });
+  const { user, roleName, roles, loading, logout, switchHat } = useSession();
   const client = useApolloClient();
-
-  // Refetch identity when the acting user changes (the server keys on the x-user-id header).
-  useEffect(() => {
-    void client.refetchQueries({ include: ["Me"] });
-  }, [client, user.id]);
-
-  const isAdmin = meData?.me.isAdmin ?? false;
-
   const [view, setView] = useState<"surface" | "admin">("surface");
   const [surfaceId, setSurfaceId] = useState("projects");
   const [surfaceTitle, setSurfaceTitle] = useState("Project Overview");
+  const [hatOpen, setHatOpen] = useState(false);
+  const [hatError, setHatError] = useState<string | null>(null);
+
+  // Refetch identity-dependent queries when the acting hat changes.
+  useEffect(() => {
+    void client.refetchQueries({ include: ["ListSurfaces"] });
+  }, [client, roleName]);
 
   // Keep the header in sync when a surface is renamed from the manage dialog.
   useEffect(() => {
@@ -52,6 +57,30 @@ export default function Home() {
     setView("surface");
   };
 
+  const pickHat = async (next: string | null) => {
+    setHatError(null);
+    const error = await switchHat(next);
+    if (error) {
+      setHatError(error);
+      return;
+    }
+    setHatOpen(false);
+    setSurfaceId("projects");
+    setSurfaceTitle("Project Overview");
+  };
+
+  if (loading) {
+    return (
+      <main className="shell">
+        <p className="state">Loading session…</p>
+      </main>
+    );
+  }
+  if (!user) return null; // middleware + session check will bounce to /login
+
+  const isAdmin = user.isAdmin;
+  const hatLabel = roleName ?? "All hats";
+
   return (
     <main className="shell">
       <aside>
@@ -59,7 +88,7 @@ export default function Home() {
           <span>◈</span>Graph Surfaces
         </div>
         <p className="eyebrow">Surfaces</p>
-        <div key={user.id}>
+        <div key={`${user.id}:${roleName}`}>
           <SurfacesNav
             activeSurfaceId={view === "surface" ? surfaceId : null}
             onSelect={(surface) => openSurface(surface.id, surface.title)}
@@ -74,8 +103,8 @@ export default function Home() {
           </nav>
         )}
         <p className="aside-note">
-          Surfaces, columns, rows and permissions live in Neo4j. The UI re-renders from whatever the
-          graph defines for the signed-in user.
+          Surfaces, columns, rows, hats and permissions live in Neo4j. The UI re-renders from whatever the
+          graph defines for the hat you are wearing.
         </p>
       </aside>
       <section className="workspace">
@@ -85,33 +114,74 @@ export default function Home() {
             <h1>{view === "admin" ? "Admin console" : surfaceTitle}</h1>
           </div>
           <div className="identity">
-            <label htmlFor="user-switch">Acting as </label>
-            <select
-              id="user-switch"
-              value={user.id}
-              onChange={(event) => {
-                const next = DEMO_USERS.find((u) => u.id === event.target.value);
-                if (next) setUser(next);
-              }}
-            >
-              {DEMO_USERS.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name} — {u.role}
-                </option>
-              ))}
-            </select>
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {user.id}
+            </Badge>
+            <span className="text-sm font-medium">{user.name}</span>
+            <Button size="sm" variant="outline" onClick={() => setHatOpen(true)} title="Switch the hat (role) this session wears">
+              🎩 {hatLabel}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => void logout()} title="Sign out">
+              <LogOut className="h-3.5 w-3.5" />
+            </Button>
           </div>
         </header>
         {view === "admin" ? (
-          <div key={user.id}>
+          <div key={`${user.id}:${roleName}`}>
             <AdminPanel onOpenSurface={openSurface} />
           </div>
         ) : (
-          <div key={`${user.id}:${surfaceId}`}>
+          <div key={`${user.id}:${roleName}:${surfaceId}`}>
             <DynamicSurface surfaceId={surfaceId} />
           </div>
         )}
       </section>
+
+      {/* ---------------- Hat switcher ---------------- */}
+      <Dialog open={hatOpen} onOpenChange={setHatOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Switch hat</DialogTitle>
+            <DialogDescription>
+              Hats are roles — each has its own surfaces and permissions. Wearing one restricts this session to
+              what that hat can see. “All hats” merges every role you hold.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <button
+              onClick={() => void pickHat(null)}
+              className={`block w-full rounded-md border px-3 py-2 text-left text-sm hover:bg-muted ${
+                hatLabel === "All hats" ? "border-primary bg-muted" : "border-border"
+              }`}
+            >
+              <span className="font-medium">All hats</span>
+              <span className="block text-xs text-muted-foreground">Union of every role you hold</span>
+            </button>
+            {roles.map((role) => (
+              <button
+                key={role}
+                onClick={() => void pickHat(role)}
+                className={`block w-full rounded-md border px-3 py-2 text-left text-sm hover:bg-muted ${
+                  roleName === role ? "border-primary bg-muted" : "border-border"
+                }`}
+              >
+                🎩 {role}
+              </button>
+            ))}
+            {roles.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                You hold no roles yet — an admin can assign you hats in the Admin console.
+              </p>
+            )}
+            {hatError && <p className="text-sm text-destructive">{hatError}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setHatOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </main>
   );
 }

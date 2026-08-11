@@ -30,7 +30,7 @@ import {
   TabsTrigger,
 } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { useDemoUser } from "@/components/apollo-provider";
+import { useSession } from "@/components/session-provider";
 
 // ---------------------------------------------------------------------------
 // GraphQL
@@ -105,6 +105,12 @@ const UPDATE_USER = gql`
 const DELETE_USER = gql`
   mutation AdminDeleteUser($id: ID!) {
     adminDeleteUser(id: $id)
+  }
+`;
+
+const SET_PASSWORD = gql`
+  mutation AdminSetPassword($id: ID!, $password: String!) {
+    adminSetPassword(id: $id, password: $password)
   }
 `;
 
@@ -230,7 +236,7 @@ type AuditEvent = {
   changes: unknown;
 };
 type Permissions = { view: boolean; create: boolean; update: boolean; delete: boolean; export: boolean; manage: boolean };
-type AdminUser = { id: string; name: string; isAdmin: boolean; roles: string[] };
+type AdminUser = { id: string; name: string; isAdmin: boolean; hasPassword?: boolean; roles: string[] };
 type RoleGrant = { surfaceId: string; surfaceTitle: string; permissions: Permissions };
 type RoleInfo = { id: string; name: string; grants: RoleGrant[] };
 type AdminSurface = { id: string; title: string; renderer: string; rootLabel: string; columnCount: number; deleted: boolean };
@@ -279,7 +285,8 @@ function grantSummary(grants: RoleGrant[]) {
 // Admin panel
 // ---------------------------------------------------------------------------
 export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: string, title: string) => void }) {
-  const { user: me } = useDemoUser();
+  const { user: me } = useSession();
+  if (!me) return null; // unreachable behind auth, but keeps TS honest
   const usersQuery = useQuery<{ adminUsers: AdminUser[] }>(ADMIN_USERS, { fetchPolicy: "no-cache" });
   const rolesQuery = useQuery<{ adminRoles: RoleInfo[] }>(ADMIN_ROLES, { fetchPolicy: "no-cache" });
   const surfacesQuery = useQuery<{ adminSurfaces: AdminSurface[] }>(ADMIN_SURFACES, { fetchPolicy: "no-cache" });
@@ -287,6 +294,7 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
   const [createUser] = useMutation(CREATE_USER);
   const [updateUser] = useMutation(UPDATE_USER);
   const [deleteUser] = useMutation(DELETE_USER);
+  const [setPassword] = useMutation(SET_PASSWORD);
   const [assignRole] = useMutation(ASSIGN_ROLE);
   const [removeRole] = useMutation(REMOVE_ROLE);
   const [createRole] = useMutation(CREATE_ROLE);
@@ -303,6 +311,8 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
   const [newUserOpen, setNewUserOpen] = useState(false);
   const [newUser, setNewUser] = useState({ id: "", name: "", isAdmin: false });
   const [rolesFor, setRolesFor] = useState<AdminUser | null>(null);
+  const [passwordFor, setPasswordFor] = useState<AdminUser | null>(null);
+  const [passwordDraft, setPasswordDraft] = useState("");
   const [newRoleOpen, setNewRoleOpen] = useState(false);
   const [newRoleName, setNewRoleName] = useState("");
   const [grantsFor, setGrantsFor] = useState<RoleInfo | null>(null);
@@ -385,6 +395,19 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
       const fresh = usersQuery.data?.adminUsers.find((u) => u.id === target.id);
       if (fresh) setRolesFor(fresh);
     }
+  };
+
+  const submitPassword = async () => {
+    if (!passwordFor || passwordDraft.length < 6) {
+      setNotice("Password must be at least 6 characters.");
+      return;
+    }
+    await run(
+      () => setPassword({ variables: { id: passwordFor.id, password: passwordDraft } }),
+      `Password set for ${passwordFor.name}.`,
+    );
+    setPasswordFor(null);
+    setPasswordDraft("");
   };
 
   const submitNewUser = async () => {
@@ -491,6 +514,7 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
                   <TableHead>User</TableHead>
                   <TableHead>ID</TableHead>
                   <TableHead>Admin</TableHead>
+                  <TableHead>Password</TableHead>
                   <TableHead>Roles</TableHead>
                   <TableHead className="w-40 text-right">Actions</TableHead>
                 </TableRow>
@@ -501,6 +525,9 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
                     <TableCell className="font-medium">{u.name}</TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{u.id}</TableCell>
                     <TableCell>{u.isAdmin ? <Badge variant="success"><Shield className="h-3 w-3" /> admin</Badge> : <Badge variant="secondary">no</Badge>}</TableCell>
+                    <TableCell>
+                      {u.hasPassword ? <Badge variant="outline">set</Badge> : <Badge variant="warning">none</Badge>}
+                    </TableCell>
                     <TableCell>
                       <span className="flex flex-wrap gap-1">
                         {u.roles.length === 0 && <span className="text-muted-foreground">—</span>}
@@ -513,6 +540,9 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
                       <span className="inline-flex gap-1">
                         <Button size="sm" variant="outline" onClick={() => setRolesFor(u)}>
                           <UserCog /> Roles
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={() => { setPasswordFor(u); setPasswordDraft(""); }}>
+                          Set password
                         </Button>
                         {!u.isAdmin && (
                           <Button
@@ -762,6 +792,33 @@ export function AdminPanel({ onOpenSurface }: { onOpenSurface: (surfaceId: strin
           <DialogFooter>
             <Button variant="outline" onClick={() => setNewUserOpen(false)}>Cancel</Button>
             <Button onClick={() => void submitNewUser()}>Create</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ---------------- Set password dialog ---------------- */}
+      <Dialog open={passwordFor !== null} onOpenChange={(open) => { if (!open) setPasswordFor(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Set password for {passwordFor?.name}</DialogTitle>
+            <DialogDescription>
+              Passwords are stored as bcrypt hashes on the User node. This is how invited people get
+              (or reset) their login.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-1.5">
+            <Label htmlFor="pw-input">Password (min 6 characters)</Label>
+            <Input
+              id="pw-input"
+              type="password"
+              autoComplete="new-password"
+              value={passwordDraft}
+              onChange={(e) => setPasswordDraft(e.target.value)}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPasswordFor(null)}>Cancel</Button>
+            <Button onClick={() => void submitPassword()} disabled={passwordDraft.length < 6}>Set password</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

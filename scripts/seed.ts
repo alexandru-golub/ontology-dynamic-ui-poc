@@ -1,3 +1,6 @@
+import { config as loadEnv } from "dotenv";
+loadEnv({ path: ".env.local" });
+
 import { driver } from "../lib/neo4j";
 
 const clearQuery = `MATCH (n) DETACH DELETE n`;
@@ -10,15 +13,25 @@ const constraints = [
   `CREATE CONSTRAINT customer_name IF NOT EXISTS FOR (n:Customer) REQUIRE n.name IS UNIQUE`,
   `CREATE CONSTRAINT status_name IF NOT EXISTS FOR (n:Status) REQUIRE n.name IS UNIQUE`,
   `CREATE CONSTRAINT project_id IF NOT EXISTS FOR (n:Project) REQUIRE n.id IS UNIQUE`,
+  `CREATE CONSTRAINT session_token_hash IF NOT EXISTS FOR (n:Session) REQUIRE n.tokenHash IS UNIQUE`,
 ];
 
 const query = `
-// ---- Users & roles -------------------------------------------------------
-CREATE (admin:User {id: 'admin_001', name: 'Ada Admin', isAdmin: true})
-CREATE (john:User {id: 'user_101', name: 'John Doe', isAdmin: false})-[:HAS_ROLE]->(sales:Role {id: 'role_sales', name: 'Sales'})
-CREATE (jane:User {id: 'user_202', name: 'Jane Smith', isAdmin: false})-[:HAS_ROLE]->(analyst:Role {id: 'role_analyst', name: 'Analyst'})
+// ---- Users & roles (real people = User; hats = Role) ---------------------
+// Passwords come from HAT_PASSWORD (or are generated and printed). Users
+// without a passwordHash cannot log in until an admin sets one.
+CREATE (admin:User {id: 'admin_001', name: 'Ada Admin', isAdmin: true, passwordHash: $pw})
+CREATE (john:User {id: 'user_101', name: 'John Doe', isAdmin: false, passwordHash: $pw})
+CREATE (jane:User {id: 'user_202', name: 'Jane Smith', isAdmin: false, passwordHash: $pw})
+CREATE (sam:User {id: 'user_303', name: 'Sam Rivera', isAdmin: false, passwordHash: $pw})
 CREATE (adminRole:Role {id: 'role_admin', name: 'Admin'})
+CREATE (pm:Role {id: 'role_pm', name: 'Project Manager'})
+CREATE (bizdev:Role {id: 'role_bizdev', name: 'Business Development'})
+CREATE (engineer:Role {id: 'role_engineer', name: 'Software Engineer'})
 CREATE (admin)-[:HAS_ROLE]->(adminRole)
+CREATE (john)-[:HAS_ROLE]->(pm)
+CREATE (jane)-[:HAS_ROLE]->(bizdev)
+CREATE (sam)-[:HAS_ROLE]->(engineer)
 
 // ---- Surfaces (UI planes defined in the graph) ---------------------------
 CREATE (projectsSurface:Surface {id: 'projects', title: 'Project Overview', name: 'Projects Matrix', renderer: 'table', rootLabel: 'Project'})
@@ -159,50 +172,76 @@ CREATE (project4)-[:HAS_STATUS]->(active)
 CREATE (acme)-[:HAS_PROJECT]->(project5)
 CREATE (project5)-[:HAS_STATUS]->(draft)
 
-// ---- Permissions ---------------------------------------------------------
-// John (Sales): full row CRUD on projects (delete via override), manage on customers.
-CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(projectsSurface)
+// ---- Permissions (per hat = per role) ------------------------------------
+// Project Manager hat: full row CRUD on projects (delete via override), manage on customers.
+CREATE (pm)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(projectsSurface)
 CREATE (john)-[:SURFACE_OVERRIDE {delete: true}]->(projectsSurface)
-CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: true, export: true, manage: true}]->(customersSurface)
+CREATE (pm)-[:CAN_ACCESS {view: true, create: true, update: true, delete: true, export: true, manage: true}]->(customersSurface)
 
-// Jane (Analyst): read-only + export everywhere.
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(projectsSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(customersSurface)
+// Business Development hat: read-only + export everywhere, edits on intake.
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(projectsSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(customersSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(intakeSurface)
 
 // Everyone can view People & Roles; only admins (flag) can manage users there.
-CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
+CREATE (pm)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(peopleSurface)
 
-// Project Board — Sales can move cards between lanes (update); Analyst read-only.
-CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(boardSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(boardSurface)
+// Project Board — PM can move cards between lanes (update); others read-only.
+CREATE (pm)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(boardSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(boardSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: true, delete: false, export: true, manage: false}]->(boardSurface)
 
-// Pivot + Schedule — read-only + export for everyone.
-CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(pivotSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(pivotSurface)
-CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
+// Pivot + Schedule — read-only + export for every hat.
+CREATE (pm)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(pivotSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(pivotSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(pivotSurface)
+CREATE (pm)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(scheduleSurface)
 
-// Project Intake — Sales can create + edit records (multi-record editing demo); Analyst read-only.
-CREATE (sales)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(intakeSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(intakeSurface)
+// Project Intake — PM creates/edits records (multi-record editing demo); Engineer read-only.
+CREATE (pm)-[:CAN_ACCESS {view: true, create: true, update: true, delete: false, export: true, manage: false}]->(intakeSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(intakeSurface)
 
-// Customer Analytics — read-only + export for everyone (aggregate columns are derived).
-CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
+// Customer Analytics — read-only + export for every hat (aggregate columns are derived).
+CREATE (pm)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(analyticsSurface)
 
-// Project Calendar — read-only + export for everyone.
-CREATE (sales)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
-CREATE (analyst)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
+// Project Calendar — read-only + export for every hat.
+CREATE (pm)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
+CREATE (bizdev)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
+CREATE (engineer)-[:CAN_ACCESS {view: true, create: false, update: false, delete: false, export: true, manage: false}]->(calendarSurface)
 `;
 
 async function seed() {
+  const { hashPassword } = await import("../lib/auth");
+  // HAT_PASSWORD sets one password for every seeded account (dev convenience);
+  // when missing, each account gets a random password printed to the console.
+  const fixed = process.env.HAT_PASSWORD;
+  const generated = new Map<string, string>();
+  const passwordFor = (login: string) => {
+    if (fixed) return fixed;
+    const pw = `hat-${login}-${Math.random().toString(36).slice(2, 10)}`;
+    generated.set(login, pw);
+    return pw;
+  };
+  const pw = hashPassword(passwordFor("admin_001"));
+
   const session = driver.session();
   try {
     for (const constraint of constraints) await session.run(constraint);
     await session.run(clearQuery);
-    await session.run(query);
-    console.log("Seeded admin, 2 demo users, 9 multi-source surfaces (form intake + aggregate analytics + calendar), validation rules and permissions.");
+    await session.run(query, { pw });
+    console.log("Seeded admin, 3 demo users, 4 hats (roles), 9 multi-source surfaces, validation rules and permissions.");
+    if (generated.size > 0) {
+      console.log("Generated login passwords (save them!):");
+      for (const [login, password] of generated) console.log(`  ${login} / ${password}`);
+    } else {
+      console.log("All seeded accounts use the HAT_PASSWORD env value.");
+    }
   } finally {
     await session.close();
     await driver.close();
